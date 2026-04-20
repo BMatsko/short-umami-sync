@@ -60,7 +60,7 @@ func main() {
 
 func newApp() *app {
 	return &app{
-		password:      os.Getenv("APP_PASSWORD"),
+		password:      envOr("APP_PASSWORD", "changeme"),
 		sessionSecret: mustEnv("SESSION_SECRET"),
 		umamiEndpoint: os.Getenv("UMAMI_ENDPOINT"),
 		umamiAPIKey:   os.Getenv("UMAMI_API_KEY"),
@@ -98,10 +98,6 @@ func (a *app) loginHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		_ = a.tmplLogin.Execute(w, map[string]any{"Error": ""})
 	case http.MethodPost:
-		if a.password == "" {
-			http.Error(w, "APP_PASSWORD is not configured", http.StatusInternalServerError)
-			return
-		}
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "invalid form", http.StatusBadRequest)
 			return

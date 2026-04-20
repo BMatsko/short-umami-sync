@@ -4,8 +4,8 @@ Go backend for accepting Short.io webhooks, showing them in a password-protected
 
 ## Environment variables
 
-- `APP_PASSWORD` – dashboard password
-- `SESSION_SECRET` – cookie signing secret
+- `APP_PASSWORD` – dashboard password (defaults to `changeme` if unset)
+- `SESSION_SECRET` – cookie signing secret (defaults to a development value if unset)
 - `UMAMI_ENDPOINT` – Umami tracking API endpoint to POST forwarded events to
 - `UMAMI_API_KEY` – optional bearer token for Umami
 - `UMAMI_WEBSITE_ID` – optional website identifier shown in the dashboard and included in forwarded payloads
