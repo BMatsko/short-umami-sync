@@ -25,8 +25,10 @@ import (
 type Event struct {
 	ReceivedAt   time.Time       `json:"received_at"`
 	Source       string          `json:"source"`
+	WebhookKey   string          `json:"webhook_key,omitempty"`
 	Domain       string          `json:"domain,omitempty"`
 	PropertyID   string          `json:"property_id,omitempty"`
+	ResolvedFrom string          `json:"resolved_from,omitempty"`
 	Payload      json.RawMessage `json:"payload"`
 	Forwarded    bool            `json:"forwarded"`
 	ForwardError string          `json:"forward_error,omitempty"`
@@ -66,10 +68,11 @@ func main() {
 	mux.HandleFunc("/dashboard/mappings", cfg.requireAuth(cfg.mappingUpsertHandler))
 	mux.HandleFunc("/dashboard/mappings/delete", cfg.requireAuth(cfg.mappingDeleteHandler))
 	mux.HandleFunc("/webhooks/shortio", cfg.shortioWebhookHandler)
+	mux.HandleFunc("/webhooks/shortio/", cfg.shortioWebhookHandler)
 	mux.HandleFunc("/", cfg.rootHandler)
 
 	addr := ":" + envOr("PORT", "8080")
-	log.Printf("starting short-umami-sync on %s", addr)
+		log.Printf("event=startup service=short-umami-sync address=%s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -158,10 +161,12 @@ func (a *app) loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.FormValue("password") != a.password {
+			log.Printf("event=login_failed remote=%s", r.RemoteAddr)
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = a.tmplLogin.Execute(w, map[string]any{"Error": "Incorrect password."})
 			return
 		}
+		log.Printf("event=login_success remote=%s", r.RemoteAddr)
 		http.SetCookie(w, a.sessionCookie())
 		http.Redirect(w, r, "/dashboard", http.StatusFound)
 	default:
@@ -175,6 +180,7 @@ func (a *app) logoutHandler(w http.ResponseWriter, r *http.Request) {
 		cookie.Secure = true
 	}
 	http.SetCookie(w, cookie)
+	log.Printf("event=logout remote=%s", r.RemoteAddr)
 	http.Redirect(w, r, "/login", http.StatusFound)
 }
 
@@ -192,12 +198,13 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(items, func(i, j int) bool { return items[i].ReceivedAt.After(items[j].ReceivedAt) })
 
 	_ = a.tmplDash.Execute(w, map[string]any{
-		"Events":           items,
-		"Mappings":         mappings,
-		"UmamiEndpoint":     a.umamiEndpoint,
-		"DefaultPropertyID": a.umamiDefaultProp,
-		"Message":          r.URL.Query().Get("message"),
-		"Error":            r.URL.Query().Get("error"),
+		"Events":             items,
+		"Mappings":           mappings,
+		"UmamiEndpoint":      a.umamiEndpoint,
+		"DefaultPropertyID":  a.umamiDefaultProp,
+		"WebhookRoutePattern": "/webhooks/shortio/:domain_or_id",
+		"Message":            r.URL.Query().Get("message"),
+		"Error":              r.URL.Query().Get("error"),
 	})
 }
 
@@ -210,17 +217,22 @@ func (a *app) mappingUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		redirectWithError(w, r, "invalid form")
 		return
 	}
-	domain := normalizeDomain(r.FormValue("domain"))
+	originalKey := normalizeMappingKey(r.FormValue("original_domain"))
+	key := normalizeMappingKey(r.FormValue("domain"))
 	propertyID := strings.TrimSpace(r.FormValue("property_id"))
-	if domain == "" || propertyID == "" {
+	if key == "" || propertyID == "" {
 		redirectWithError(w, r, "domain and property ID are required")
 		return
 	}
-	if err := a.upsertMapping(r.Context(), domain, propertyID); err != nil {
+	if originalKey == "" {
+		originalKey = key
+	}
+	if err := a.saveMapping(r.Context(), originalKey, key, propertyID); err != nil {
 		redirectWithError(w, r, "save failed: "+err.Error())
 		return
 	}
-	redirectWithMessage(w, r, fmt.Sprintf("Saved mapping for %s", domain))
+	log.Printf("event=mapping_saved original_key=%q key=%q property_id=%q", originalKey, key, propertyID)
+	redirectWithMessage(w, r, fmt.Sprintf("Saved mapping for %s", key))
 }
 
 func (a *app) mappingDeleteHandler(w http.ResponseWriter, r *http.Request) {
@@ -232,16 +244,17 @@ func (a *app) mappingDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		redirectWithError(w, r, "invalid form")
 		return
 	}
-	domain := normalizeDomain(r.FormValue("domain"))
-	if domain == "" {
+	key := normalizeMappingKey(r.FormValue("domain"))
+	if key == "" {
 		redirectWithError(w, r, "domain is required")
 		return
 	}
-	if err := a.deleteMapping(r.Context(), domain); err != nil {
+	if err := a.deleteMapping(r.Context(), key); err != nil {
 		redirectWithError(w, r, "delete failed: "+err.Error())
 		return
 	}
-	redirectWithMessage(w, r, fmt.Sprintf("Deleted mapping for %s", domain))
+	log.Printf("event=mapping_deleted key=%q", key)
+	redirectWithMessage(w, r, fmt.Sprintf("Deleted mapping for %s", key))
 }
 
 func redirectWithMessage(w http.ResponseWriter, r *http.Request, msg string) {
@@ -266,15 +279,26 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty payload", http.StatusBadRequest)
 		return
 	}
+	routeKey := ""
+	if strings.HasPrefix(r.URL.Path, "/webhooks/shortio/") {
+		routeKey = normalizeMappingKey(strings.TrimPrefix(r.URL.Path, "/webhooks/shortio/"))
+	}
 	payload := json.RawMessage(body)
-	domain := extractDomain(payload)
-	propertyID, resolvedFrom, resolveErr := a.resolvePropertyID(r.Context(), domain)
-	event := Event{ReceivedAt: time.Now().UTC(), Source: "shortio", Domain: domain, PropertyID: propertyID, Payload: payload}
+	payloadDomain := extractDomain(payload)
+	propertyID, resolvedFrom, resolveErr := a.resolvePropertyID(r.Context(), routeKey, payloadDomain)
+	event := Event{ReceivedAt: time.Now().UTC(), Source: "shortio", WebhookKey: routeKey, Domain: payloadDomain, PropertyID: propertyID, ResolvedFrom: resolvedFrom, Payload: payload}
+	log.Printf("event=webhook_received source=shortio path=%q route_key=%q payload_domain=%q property_id=%q", r.URL.Path, routeKey, payloadDomain, propertyID)
 	if resolveErr != nil {
 		event.Forwarded = false
 		event.ForwardError = resolveErr.Error()
+		log.Printf("event=webhook_resolution_failed source=shortio path=%q route_key=%q payload_domain=%q error=%q", r.URL.Path, routeKey, payloadDomain, resolveErr.Error())
 	} else {
-		event.Forwarded, event.ForwardError = a.forwardToUmami(r, payload, domain, propertyID, resolvedFrom)
+		event.Forwarded, event.ForwardError = a.forwardToUmami(r, payload, routeKey, payloadDomain, propertyID, resolvedFrom)
+		if event.Forwarded {
+			log.Printf("event=webhook_forwarded source=shortio path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s", r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom)
+		} else {
+			log.Printf("event=webhook_forward_failed source=shortio path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s error=%q", r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom, event.ForwardError)
+		}
 	}
 	a.mu.Lock()
 	a.events = append(a.events, event)
@@ -283,26 +307,35 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": event.Forwarded, "error": event.ForwardError, "domain": domain, "property_id": propertyID})
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": event.Forwarded, "error": event.ForwardError, "domain": payloadDomain, "route_key": routeKey, "property_id": propertyID, "resolved_from": resolvedFrom})
 }
 
-func (a *app) resolvePropertyID(ctx context.Context, domain string) (propertyID string, resolvedFrom string, err error) {
-	if domain != "" {
-		mapped, err := a.getMapping(ctx, domain)
+func (a *app) resolvePropertyID(ctx context.Context, routeKey, payloadDomain string) (propertyID string, resolvedFrom string, err error) {
+	for _, candidate := range []struct {
+		value  string
+		source string
+	}{
+		{value: routeKey, source: "route"},
+		{value: payloadDomain, source: "payload"},
+	} {
+		if candidate.value == "" {
+			continue
+		}
+		mapped, err := a.getMapping(ctx, candidate.value)
 		if err != nil {
 			return "", "", err
 		}
 		if mapped != "" {
-			return mapped, "database", nil
+			return mapped, candidate.source, nil
 		}
 	}
 	if strings.TrimSpace(a.umamiDefaultProp) != "" {
 		return strings.TrimSpace(a.umamiDefaultProp), "environment", nil
 	}
-	return "", "", fmt.Errorf("no domain mapping found for %q", domain)
+	return "", "", fmt.Errorf("no domain mapping found for route key %q or payload domain %q", routeKey, payloadDomain)
 }
 
-func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, propertyID, resolvedFrom string) (bool, string) {
+func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, routeKey, payloadDomain, propertyID, resolvedFrom string) (bool, string) {
 	if a.umamiEndpoint == "" {
 		return false, "UMAMI_ENDPOINT is not configured"
 	}
@@ -317,8 +350,10 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		},
 		"payload": json.RawMessage(payload),
 	}
-	if domain != "" {
-		forward["domain"] = domain
+	if routeKey != "" {
+		forward["domain"] = routeKey
+	} else if payloadDomain != "" {
+		forward["domain"] = payloadDomain
 	}
 	if propertyID != "" {
 		forward["website_id"] = propertyID
@@ -393,16 +428,28 @@ func (a *app) getMapping(ctx context.Context, domain string) (string, error) {
 	return propertyID, nil
 }
 
-func (a *app) upsertMapping(ctx context.Context, domain, propertyID string) error {
+func (a *app) saveMapping(ctx context.Context, originalDomain, domain, propertyID string) error {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	_, err := a.db.ExecContext(queryCtx, `
+	tx, err := a.db.BeginTx(queryCtx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if originalDomain != "" && originalDomain != domain {
+		if _, err := tx.ExecContext(queryCtx, `DELETE FROM domain_mappings WHERE domain = $1`, originalDomain); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(queryCtx, `
 		INSERT INTO domain_mappings (domain, property_id, created_at, updated_at)
 		VALUES ($1, $2, now(), now())
 		ON CONFLICT (domain)
 		DO UPDATE SET property_id = EXCLUDED.property_id, updated_at = now()
-	`, domain, propertyID)
-	return err
+	`, domain, propertyID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (a *app) deleteMapping(ctx context.Context, domain string) error {
@@ -469,6 +516,38 @@ func parseInt64(s string) (int64, error) {
 	var n int64
 	_, err := fmt.Sscanf(s, "%d", &n)
 	return n, err
+}
+
+func normalizeMappingKey(raw string) string {
+	value := strings.TrimSpace(strings.ToLower(raw))
+	if value == "" {
+		return ""
+	}
+	if strings.Contains(value, "://") {
+		if parsed, err := url.Parse(value); err == nil && parsed.Host != "" {
+			value = parsed.Host
+		}
+	}
+	if idx := strings.Index(value, "/"); idx >= 0 {
+		value = value[:idx]
+	}
+	if idx := strings.Index(value, ":"); idx >= 0 {
+		value = value[:idx]
+	}
+	return strings.TrimSuffix(value, ".")
+}
+
+func logEvent(message string, fields map[string]any) {
+	parts := []string{message}
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, fields[k]))
+	}
+	log.Println(strings.Join(parts, " "))
 }
 
 func normalizeDomain(raw string) string {
@@ -595,12 +674,14 @@ const dashboardTemplate = `<!doctype html>
     a { color: #0b57d0; }
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e5e5e5; vertical-align: top; }
-    form.inline { display: inline; }
     .success { color: #0a7a2f; }
     .error { color: #b00020; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     input { width: 100%; box-sizing: border-box; font: inherit; padding: 10px 12px; }
     button { font: inherit; padding: 8px 12px; }
+    .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .row-card { border: 1px solid #eee; border-radius: 10px; padding: 14px; margin-top: 12px; }
+    .inline-actions { display: flex; gap: 8px; align-items: center; }
   </style>
 </head>
 <body>
@@ -612,42 +693,41 @@ const dashboardTemplate = `<!doctype html>
     <h2>Configuration</h2>
     <p class="muted">Umami endpoint: <code>{{.UmamiEndpoint}}</code></p>
     <p class="muted">Fallback Umami property ID: <code>{{.DefaultPropertyID}}</code></p>
-    <p class="muted">Short.io webhook URL: <code>/webhooks/shortio</code></p>
-    <p class="muted">Mapped domains override the fallback property ID.</p>
+    <p class="muted">Short.io webhook route: <code>{{.WebhookRoutePattern}}</code></p>
+    <p class="muted">Use a unique route like <code>/webhooks/shortio/example.short.gy</code> or <code>/webhooks/shortio/short-domain-id</code> to target a specific mapping.</p>
   </div>
   <div class="card">
-    <h2>Domain-to-property mappings</h2>
+    <h2>Sync mappings</h2>
     <form method="post" action="/dashboard/mappings">
       <div class="grid">
-        <label>Short.io domain<br><input type="text" name="domain" placeholder="example.short.gy"></label>
+        <label>Short.io domain or ID<br><input type="text" name="domain" placeholder="example.short.gy or short-domain-id"></label>
         <label>Umami property ID<br><input type="text" name="property_id" placeholder="umami-property-id"></label>
       </div>
-      <p><button type="submit">Save mapping</button></p>
+      <p><button type="submit">Add mapping</button></p>
     </form>
-    <table>
-      <thead>
-        <tr><th>Domain</th><th>Property ID</th><th>Updated</th><th></th></tr>
-      </thead>
-      <tbody>
-        {{if .Mappings}}
-          {{range .Mappings}}
-            <tr>
-              <td><code>{{.Domain}}</code></td>
-              <td><code>{{.PropertyID}}</code></td>
-              <td>{{.UpdatedAt.Format "2006-01-02 15:04:05 MST"}}</td>
-              <td>
-                <form class="inline" method="post" action="/dashboard/mappings/delete">
-                  <input type="hidden" name="domain" value="{{.Domain}}">
-                  <button type="submit">Delete</button>
-                </form>
-              </td>
-            </tr>
-          {{end}}
-        {{else}}
-          <tr><td colspan="4" class="muted">No mappings configured yet.</td></tr>
-        {{end}}
-      </tbody>
-    </table>
+    {{if .Mappings}}
+      {{range .Mappings}}
+        <div class="row-card">
+          <form method="post" action="/dashboard/mappings">
+            <input type="hidden" name="original_domain" value="{{.Domain}}">
+            <div class="grid">
+              <label>Short.io domain or ID<br><input type="text" name="domain" value="{{.Domain}}"></label>
+              <label>Umami property ID<br><input type="text" name="property_id" value="{{.PropertyID}}"></label>
+            </div>
+            <div class="row-actions">
+              <button type="submit">Save</button>
+              <span class="muted">Created {{.CreatedAt.Format "2006-01-02 15:04:05 MST"}} · Updated {{.UpdatedAt.Format "2006-01-02 15:04:05 MST"}}</span>
+            </div>
+          </form>
+          <form class="inline-actions" method="post" action="/dashboard/mappings/delete">
+            <input type="hidden" name="domain" value="{{.Domain}}">
+            <button type="submit">Delete</button>
+          </form>
+        </div>
+      {{end}}
+    {{else}}
+      <p class="muted">No mappings configured yet.</p>
+    {{end}}
   </div>
   <div class="card">
     <h2>Recent webhook events</h2>
@@ -655,8 +735,10 @@ const dashboardTemplate = `<!doctype html>
       {{range .Events}}
         <div class="card">
           <div><strong>{{.Source}}</strong> — {{.ReceivedAt.Format "2006-01-02 15:04:05 MST"}}</div>
-          <div>Domain: <code>{{.Domain}}</code></div>
+          <div>Webhook key: <code>{{.WebhookKey}}</code></div>
+          <div>Payload domain: <code>{{.Domain}}</code></div>
           <div>Property ID: <code>{{.PropertyID}}</code></div>
+          <div>Resolved from: {{.ResolvedFrom}}</div>
           <div>Forwarded to Umami: {{.Forwarded}}</div>
           {{if .ForwardError}}<div class="muted">{{.ForwardError}}</div>{{end}}
           <pre>{{printf "%s" .Payload}}</pre>
