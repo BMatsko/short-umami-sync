@@ -67,6 +67,7 @@ func main() {
 	mux.HandleFunc("/dashboard", cfg.requireAuth(cfg.dashboardHandler))
 	mux.HandleFunc("/dashboard/mappings", cfg.requireAuth(cfg.mappingUpsertHandler))
 	mux.HandleFunc("/dashboard/mappings/delete", cfg.requireAuth(cfg.mappingDeleteHandler))
+	mux.HandleFunc("/dashboard/settings", cfg.requireAuth(cfg.settingsHandler))
 	mux.HandleFunc("/webhooks/shortio", cfg.shortioWebhookHandler)
 	mux.HandleFunc("/webhooks/shortio/", cfg.shortioWebhookHandler)
 	mux.HandleFunc("/", cfg.rootHandler)
@@ -104,7 +105,7 @@ func mustNewApp() *app {
 		log.Fatal(err)
 	}
 
-	return &app{
+	a := &app{
 		db:               db,
 		password:         envOr("APP_PASSWORD", "changeme"),
 		sessionSecret:    mustEnv("SESSION_SECRET"),
@@ -114,6 +115,12 @@ func mustNewApp() *app {
 		tmplLogin:        template.Must(template.New("login").Parse(loginTemplate)),
 		tmplDash:         template.Must(template.New("dashboard").Parse(dashboardTemplate)),
 	}
+
+	if err := a.loadSettingsFromDB(ctx); err != nil {
+		log.Printf("event=settings_load_warning error=%q (falling back to env vars)", err)
+	}
+
+	return a
 }
 
 func initSchema(ctx context.Context, db *sql.DB) error {
@@ -122,6 +129,11 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 			domain TEXT PRIMARY KEY,
 			property_id TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT,
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
 	`)
@@ -197,14 +209,20 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	sort.Slice(items, func(i, j int) bool { return items[i].ReceivedAt.After(items[j].ReceivedAt) })
 
+	a.mu.Lock()
+	umamiEndpoint := a.umamiEndpoint
+	umamiAPIKey := a.umamiAPIKey
+	a.mu.Unlock()
+
 	_ = a.tmplDash.Execute(w, map[string]any{
-		"Events":             items,
-		"Mappings":           mappings,
-		"UmamiEndpoint":      a.umamiEndpoint,
-		"DefaultPropertyID":  a.umamiDefaultProp,
+		"Events":              items,
+		"Mappings":            mappings,
+		"UmamiEndpoint":       umamiEndpoint,
+		"UmamiAPIKey":         umamiAPIKey,
+		"DefaultPropertyID":   a.umamiDefaultProp,
 		"WebhookRoutePattern": "/webhooks/shortio/:domain_or_id",
-		"Message":            r.URL.Query().Get("message"),
-		"Error":              r.URL.Query().Get("error"),
+		"Message":             r.URL.Query().Get("message"),
+		"Error":               r.URL.Query().Get("error"),
 	})
 }
 
@@ -255,6 +273,37 @@ func (a *app) mappingDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("event=mapping_deleted key=%q", key)
 	redirectWithMessage(w, r, fmt.Sprintf("Deleted mapping for %s", key))
+}
+
+func (a *app) settingsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		redirectWithError(w, r, "invalid form")
+		return
+	}
+	endpoint := strings.TrimSpace(r.FormValue("umami_endpoint"))
+	apiToken := strings.TrimSpace(r.FormValue("umami_api_token"))
+	if endpoint == "" || apiToken == "" {
+		redirectWithError(w, r, "Umami endpoint and API token are required")
+		return
+	}
+	if err := a.setSetting(r.Context(), "umami_endpoint", endpoint); err != nil {
+		redirectWithError(w, r, "failed to save endpoint: "+err.Error())
+		return
+	}
+	if err := a.setSetting(r.Context(), "umami_api_key", apiToken); err != nil {
+		redirectWithError(w, r, "failed to save API token: "+err.Error())
+		return
+	}
+	a.mu.Lock()
+	a.umamiEndpoint = endpoint
+	a.umamiAPIKey = apiToken
+	a.mu.Unlock()
+	log.Printf("event=settings_updated umami_endpoint=%q", endpoint)
+	redirectWithMessage(w, r, "Umami settings saved successfully")
 }
 
 func redirectWithMessage(w http.ResponseWriter, r *http.Request, msg string) {
@@ -457,6 +506,47 @@ func (a *app) deleteMapping(ctx context.Context, domain string) error {
 	defer cancel()
 	_, err := a.db.ExecContext(queryCtx, `DELETE FROM domain_mappings WHERE domain = $1`, domain)
 	return err
+}
+
+func (a *app) getSetting(ctx context.Context, key string) (string, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var value string
+	err := a.db.QueryRowContext(queryCtx, `SELECT value FROM settings WHERE key = $1`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+func (a *app) setSetting(ctx context.Context, key, value string) error {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := a.db.ExecContext(queryCtx, `
+		INSERT INTO settings (key, value, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (key)
+		DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+	`, key, value)
+	return err
+}
+
+func (a *app) loadSettingsFromDB(ctx context.Context) error {
+	endpoint, err := a.getSetting(ctx, "umami_endpoint")
+	if err != nil {
+		return err
+	}
+	apiKey, err := a.getSetting(ctx, "umami_api_key")
+	if err != nil {
+		return err
+	}
+	if endpoint != "" {
+		a.umamiEndpoint = endpoint
+	}
+	if apiKey != "" {
+		a.umamiAPIKey = apiKey
+	}
+	return nil
 }
 
 const sessionCookieName = "short_umami_session"
@@ -669,7 +759,7 @@ const dashboardTemplate = `<!doctype html>
     body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 40px auto; padding: 0 16px; }
     code, pre { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }
-    .muted { color: #666; }
+    .muted { color: #666; font-size: 0.92em; }
     pre { overflow:auto; padding: 12px; white-space: pre-wrap; }
     a { color: #0b57d0; }
     table { width: 100%; border-collapse: collapse; }
@@ -677,11 +767,18 @@ const dashboardTemplate = `<!doctype html>
     .success { color: #0a7a2f; }
     .error { color: #b00020; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    input { width: 100%; box-sizing: border-box; font: inherit; padding: 10px 12px; }
-    button { font: inherit; padding: 8px 12px; }
+    input[type="text"], input[type="url"], input[type="password"] { width: 100%; box-sizing: border-box; font: inherit; padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; transition: border-color 0.15s; }
+    input[type="text"]:focus, input[type="url"]:focus, input[type="password"]:focus { outline: none; border-color: #0b57d0; box-shadow: 0 0 0 3px rgba(11,87,208,0.12); }
+    button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+    button.primary { background: #0b57d0; color: #fff; border-color: #0b57d0; font-weight: 600; padding: 10px 20px; }
+    button.primary:hover { background: #0843a8; border-color: #0843a8; }
+    button:hover { background: #f0f0f0; }
     .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .row-card { border: 1px solid #eee; border-radius: 10px; padding: 14px; margin-top: 12px; }
     .inline-actions { display: flex; gap: 8px; align-items: center; }
+    .field-hint { font-size: 0.82em; color: #888; margin-top: 4px; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    @media (max-width: 640px) { .settings-grid, .grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -691,10 +788,27 @@ const dashboardTemplate = `<!doctype html>
   {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
   <div class="card">
     <h2>Configuration</h2>
-    <p class="muted">Umami endpoint: <code>{{.UmamiEndpoint}}</code></p>
-    <p class="muted">Fallback Umami property ID: <code>{{.DefaultPropertyID}}</code></p>
+    <form method="post" action="/dashboard/settings">
+      <div class="settings-grid">
+        <div>
+          <label for="umami_endpoint"><strong>Umami Endpoint</strong><br>
+            <input type="url" id="umami_endpoint" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://umami.example.com/api/send" autocomplete="off">
+          </label>
+          <p class="field-hint">The full URL of your Umami ingest endpoint.</p>
+        </div>
+        <div>
+          <label for="umami_api_token"><strong>API Token</strong><br>
+            <input type="password" id="umami_api_token" name="umami_api_token" value="{{.UmamiAPIKey}}" placeholder="Bearer token for Umami API" autocomplete="off">
+          </label>
+          <p class="field-hint">Used as the <code>Authorization: Bearer</code> header when forwarding events.</p>
+        </div>
+      </div>
+      <button type="submit" class="primary">Save settings</button>
+    </form>
+    <hr style="margin: 20px 0; border: none; border-top: 1px solid #eee;">
     <p class="muted">Short.io webhook route: <code>{{.WebhookRoutePattern}}</code></p>
     <p class="muted">Use a unique route like <code>/webhooks/shortio/example.short.gy</code> or <code>/webhooks/shortio/short-domain-id</code> to target a specific mapping.</p>
+    {{if .DefaultPropertyID}}<p class="muted">Fallback Umami property ID: <code>{{.DefaultPropertyID}}</code></p>{{end}}
   </div>
   <div class="card">
     <h2>Sync mappings</h2>
