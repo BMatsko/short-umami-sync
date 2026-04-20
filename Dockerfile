@@ -1,5 +1,6 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /app
+ENV GONOSUMDB=* GOFLAGS=-mod=mod
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .

@@ -52,6 +52,7 @@ type app struct {
 	events            []Event
 	tmplLogin         *template.Template
 	tmplDash          *template.Template
+	settingsFromDB    bool
 }
 
 func main() {
@@ -67,12 +68,13 @@ func main() {
 	mux.HandleFunc("/dashboard", cfg.requireAuth(cfg.dashboardHandler))
 	mux.HandleFunc("/dashboard/mappings", cfg.requireAuth(cfg.mappingUpsertHandler))
 	mux.HandleFunc("/dashboard/mappings/delete", cfg.requireAuth(cfg.mappingDeleteHandler))
+	mux.HandleFunc("/dashboard/settings", cfg.requireAuth(cfg.settingsUpdateHandler))
 	mux.HandleFunc("/webhooks/shortio", cfg.shortioWebhookHandler)
 	mux.HandleFunc("/webhooks/shortio/", cfg.shortioWebhookHandler)
 	mux.HandleFunc("/", cfg.rootHandler)
 
 	addr := ":" + envOr("PORT", "8080")
-		log.Printf("event=startup service=short-umami-sync address=%s", addr)
+	log.Printf("event=startup service=short-umami-sync address=%s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
@@ -104,7 +106,7 @@ func mustNewApp() *app {
 		log.Fatal(err)
 	}
 
-	return &app{
+	a := &app{
 		db:               db,
 		password:         envOr("APP_PASSWORD", "changeme"),
 		sessionSecret:    mustEnv("SESSION_SECRET"),
@@ -114,6 +116,13 @@ func mustNewApp() *app {
 		tmplLogin:        template.Must(template.New("login").Parse(loginTemplate)),
 		tmplDash:         template.Must(template.New("dashboard").Parse(dashboardTemplate)),
 	}
+
+	// Load settings from database, overriding environment variables when present.
+	if err := a.loadSettings(ctx); err != nil {
+		log.Printf("event=settings_load_warning error=%q (using environment variables)", err)
+	}
+
+	return a
 }
 
 func initSchema(ctx context.Context, db *sql.DB) error {
@@ -124,7 +133,58 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
+		CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
 	`)
+	return err
+}
+
+// loadSettings reads umami_endpoint and umami_api_key from the settings table
+// and overrides the values that were seeded from environment variables.
+// If a key is absent from the database the environment-variable value is kept.
+func (a *app) loadSettings(ctx context.Context) error {
+	rows, err := a.db.QueryContext(ctx, `SELECT key, value FROM settings WHERE key IN ('umami_endpoint','umami_api_key')`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	found := 0
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return err
+		}
+		switch k {
+		case "umami_endpoint":
+			a.umamiEndpoint = v
+			found++
+		case "umami_api_key":
+			a.umamiAPIKey = v
+			found++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found > 0 {
+		a.settingsFromDB = true
+	}
+	return nil
+}
+
+// saveSetting upserts a single key/value pair into the settings table.
+func (a *app) saveSetting(ctx context.Context, key, value string) error {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := a.db.ExecContext(queryCtx, `
+		INSERT INTO settings (key, value, updated_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (key)
+		DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+	`, key, value)
 	return err
 }
 
@@ -198,14 +258,54 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(items, func(i, j int) bool { return items[i].ReceivedAt.After(items[j].ReceivedAt) })
 
 	_ = a.tmplDash.Execute(w, map[string]any{
-		"Events":             items,
-		"Mappings":           mappings,
-		"UmamiEndpoint":      a.umamiEndpoint,
-		"DefaultPropertyID":  a.umamiDefaultProp,
+		"Events":              items,
+		"Mappings":            mappings,
+		"UmamiEndpoint":       a.umamiEndpoint,
+		"UmamiAPIKey":         a.umamiAPIKey,
+		"DefaultPropertyID":   a.umamiDefaultProp,
 		"WebhookRoutePattern": "/webhooks/shortio/:domain_or_id",
-		"Message":            r.URL.Query().Get("message"),
-		"Error":              r.URL.Query().Get("error"),
+		"SettingsFromDB":      a.settingsFromDB,
+		"Message":             r.URL.Query().Get("message"),
+		"Error":               r.URL.Query().Get("error"),
 	})
+}
+
+func (a *app) settingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		redirectWithError(w, r, "invalid form")
+		return
+	}
+	endpoint := strings.TrimSpace(r.FormValue("umami_endpoint"))
+	apiKey := strings.TrimSpace(r.FormValue("umami_api_key"))
+
+	if endpoint != "" {
+		if _, err := url.ParseRequestURI(endpoint); err != nil {
+			redirectWithError(w, r, "Umami Endpoint must be a valid URL")
+			return
+		}
+	}
+
+	if endpoint != "" {
+		if err := a.saveSetting(r.Context(), "umami_endpoint", endpoint); err != nil {
+			redirectWithError(w, r, "failed to save endpoint: "+err.Error())
+			return
+		}
+		a.umamiEndpoint = endpoint
+	}
+	if apiKey != "" {
+		if err := a.saveSetting(r.Context(), "umami_api_key", apiKey); err != nil {
+			redirectWithError(w, r, "failed to save API key: "+err.Error())
+			return
+		}
+		a.umamiAPIKey = apiKey
+	}
+	a.settingsFromDB = true
+	log.Printf("event=settings_updated endpoint=%q api_key_set=%v", endpoint, apiKey != "")
+	redirectWithMessage(w, r, "Settings saved successfully")
 }
 
 func (a *app) mappingUpsertHandler(w http.ResponseWriter, r *http.Request) {
@@ -639,114 +739,634 @@ func domainFromString(raw string) string {
 }
 
 const loginTemplate = `<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Short Umami Sync</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Short Umami Sync — Sign In</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 48px auto; padding: 0 16px; }
-    input, button { font: inherit; padding: 10px 12px; }
-    .error { color: #b00020; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f0f2f5;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      color: #1a1a2e;
+    }
+    .login-card {
+      background: #fff;
+      border-radius: 16px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.10), 0 1px 4px rgba(0,0,0,0.06);
+      padding: 48px 40px 40px;
+      width: 100%;
+      max-width: 420px;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 28px;
+    }
+    .logo-icon {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff;
+      font-size: 20px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .logo-text { font-size: 18px; font-weight: 700; color: #1a1a2e; line-height: 1.2; }
+    .logo-sub  { font-size: 12px; color: #6b7280; font-weight: 400; }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+    .subtitle { color: #6b7280; font-size: 14px; margin-bottom: 28px; }
+    label { display: block; font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 6px; }
+    input[type="password"] {
+      width: 100%;
+      padding: 11px 14px;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      font: inherit;
+      font-size: 15px;
+      color: #1a1a2e;
+      background: #f9fafb;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      outline: none;
+    }
+    input[type="password"]:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59,130,246,0.15);
+      background: #fff;
+    }
+    .field { margin-bottom: 20px; }
+    .btn {
+      width: 100%;
+      padding: 12px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font: inherit;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+      margin-top: 4px;
+    }
+    .btn:hover { opacity: 0.92; }
+    .btn:active { transform: scale(0.99); }
+    .alert-error {
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      color: #b91c1c;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+      margin-bottom: 20px;
+    }
   </style>
 </head>
 <body>
-  <h1>Short Umami Sync</h1>
-  <p>Sign in to manage domain-to-property mappings and view recent webhook activity.</p>
-  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-  <form method="post" action="/login">
-    <label>Password<br><input type="password" name="password" autofocus></label>
-    <button type="submit">Sign in</button>
-  </form>
+  <div class="login-card">
+    <div class="logo">
+      <div class="logo-icon">S</div>
+      <div>
+        <div class="logo-text">Short Umami Sync</div>
+        <div class="logo-sub">Analytics bridge</div>
+      </div>
+    </div>
+    <h1>Welcome back</h1>
+    <p class="subtitle">Sign in to manage your webhook mappings and settings.</p>
+    {{if .Error}}<div class="alert-error">{{.Error}}</div>{{end}}
+    <form method="post" action="/login">
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autofocus placeholder="Enter your password">
+      </div>
+      <button class="btn" type="submit">Sign in</button>
+    </form>
+  </div>
 </body>
 </html>`
 
 const dashboardTemplate = `<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Dashboard - Short Umami Sync</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard — Short Umami Sync</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 40px auto; padding: 0 16px; }
-    code, pre { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
-    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }
-    .muted { color: #666; }
-    pre { overflow:auto; padding: 12px; white-space: pre-wrap; }
-    a { color: #0b57d0; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e5e5e5; vertical-align: top; }
-    .success { color: #0a7a2f; }
-    .error { color: #b00020; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    input { width: 100%; box-sizing: border-box; font: inherit; padding: 10px 12px; }
-    button { font: inherit; padding: 8px 12px; }
-    .row-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .row-card { border: 1px solid #eee; border-radius: 10px; padding: 14px; margin-top: 12px; }
-    .inline-actions { display: flex; gap: 8px; align-items: center; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: #f0f2f5;
+      color: #1a1a2e;
+      min-height: 100vh;
+    }
+    /* ── Top nav ── */
+    .topnav {
+      background: #fff;
+      border-bottom: 1px solid #e5e7eb;
+      padding: 0 32px;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: inherit;
+    }
+    .nav-icon {
+      width: 34px; height: 34px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .nav-title { font-size: 16px; font-weight: 700; }
+    .nav-sub   { font-size: 11px; color: #6b7280; }
+    .nav-actions { display: flex; align-items: center; gap: 16px; }
+    .nav-link {
+      font-size: 13px;
+      color: #6b7280;
+      text-decoration: none;
+      padding: 6px 12px;
+      border-radius: 6px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .nav-link:hover { background: #f3f4f6; color: #1a1a2e; }
+    /* ── Page wrapper ── */
+    .page { max-width: 1100px; margin: 0 auto; padding: 32px 24px 64px; }
+    /* ── Alerts ── */
+    .alert {
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 14px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .alert-success { background: #f0fdf4; border: 1px solid #bbf7d0; color: #15803d; }
+    .alert-error   { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c; }
+    .alert-icon { font-size: 16px; flex-shrink: 0; }
+    /* ── Section cards ── */
+    .section {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .section-header {
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid #f3f4f6;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .section-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #111827;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-title .icon {
+      width: 28px; height: 28px;
+      border-radius: 7px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .icon-blue   { background: #eff6ff; color: #3b82f6; }
+    .icon-purple { background: #f5f3ff; color: #7c3aed; }
+    .icon-green  { background: #f0fdf4; color: #16a34a; }
+    .icon-orange { background: #fff7ed; color: #ea580c; }
+    .section-desc { font-size: 13px; color: #6b7280; margin-top: 2px; }
+    .section-body { padding: 20px 24px; }
+    /* ── Form elements ── */
+    .field { margin-bottom: 16px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 6px;
+    }
+    .field input[type="text"],
+    .field input[type="url"] {
+      width: 100%;
+      padding: 10px 13px;
+      border: 1.5px solid #d1d5db;
+      border-radius: 8px;
+      font: inherit;
+      font-size: 14px;
+      color: #1a1a2e;
+      background: #f9fafb;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      outline: none;
+    }
+    .field input[type="text"]:focus,
+    .field input[type="url"]:focus {
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 3px rgba(59,130,246,0.12);
+      background: #fff;
+    }
+    .field-hint { font-size: 12px; color: #9ca3af; margin-top: 4px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 640px) { .grid-2 { grid-template-columns: 1fr; } }
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 9px 18px;
+      border-radius: 8px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: opacity 0.15s, transform 0.1s, box-shadow 0.15s;
+      text-decoration: none;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn-primary {
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      color: #fff;
+      box-shadow: 0 1px 3px rgba(99,102,241,0.3);
+    }
+    .btn-primary:hover { opacity: 0.9; box-shadow: 0 2px 8px rgba(99,102,241,0.35); }
+    .btn-secondary {
+      background: #fff;
+      color: #374151;
+      border: 1.5px solid #d1d5db;
+    }
+    .btn-secondary:hover { background: #f9fafb; border-color: #9ca3af; }
+    .btn-danger {
+      background: #fff;
+      color: #b91c1c;
+      border: 1.5px solid #fca5a5;
+    }
+    .btn-danger:hover { background: #fef2f2; border-color: #f87171; }
+    .btn-sm { padding: 6px 12px; font-size: 12px; }
+    /* ── Settings source badge ── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 9px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge-db  { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; }
+    .badge-env { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+    /* ── Info row ── */
+    .info-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 0;
+      border-bottom: 1px solid #f3f4f6;
+      font-size: 13px;
+    }
+    .info-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .info-label { color: #6b7280; min-width: 180px; flex-shrink: 0; }
+    .info-value { color: #111827; font-weight: 500; }
+    code {
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      padding: 2px 7px;
+      border-radius: 5px;
+      font-size: 12px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      color: #374151;
+      word-break: break-all;
+    }
+    /* ── Mapping rows ── */
+    .mapping-row {
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 12px;
+      background: #fafafa;
+      transition: border-color 0.15s;
+    }
+    .mapping-row:hover { border-color: #c7d2fe; background: #fff; }
+    .mapping-row:last-child { margin-bottom: 0; }
+    .mapping-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+    .mapping-meta { font-size: 11px; color: #9ca3af; margin-left: auto; }
+    /* ── Events ── */
+    .event-card {
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 12px;
+      background: #fafafa;
+    }
+    .event-card:last-child { margin-bottom: 0; }
+    .event-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .event-source {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #6366f1;
+      background: #f5f3ff;
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+    .event-time { font-size: 12px; color: #9ca3af; }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .status-ok  { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; }
+    .status-err { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+    .status-pending { background: #fffbeb; color: #b45309; border: 1px solid #fde68a; }
+    .event-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-bottom: 10px; }
+    .event-field { font-size: 12px; }
+    .event-field-label { color: #9ca3af; margin-bottom: 2px; }
+    .event-field-value { color: #374151; font-weight: 500; }
+    .event-error { font-size: 12px; color: #b91c1c; background: #fef2f2; border-radius: 6px; padding: 6px 10px; margin-top: 8px; }
+    details { margin-top: 10px; }
+    summary {
+      font-size: 12px;
+      color: #6b7280;
+      cursor: pointer;
+      user-select: none;
+      padding: 4px 0;
+    }
+    summary:hover { color: #374151; }
+    pre {
+      background: #1e1e2e;
+      color: #cdd6f4;
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin-top: 8px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      line-height: 1.6;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: #9ca3af;
+    }
+    .empty-state .empty-icon { font-size: 36px; margin-bottom: 10px; }
+    .empty-state p { font-size: 14px; }
+    a { color: #3b82f6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .divider { height: 1px; background: #f3f4f6; margin: 16px 0; }
   </style>
 </head>
 <body>
-  <h1>Short Umami Sync</h1>
-  <p><a href="/logout">Log out</a></p>
-  {{if .Message}}<p class="success">{{.Message}}</p>{{end}}
-  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-  <div class="card">
-    <h2>Configuration</h2>
-    <p class="muted">Umami endpoint: <code>{{.UmamiEndpoint}}</code></p>
-    <p class="muted">Fallback Umami property ID: <code>{{.DefaultPropertyID}}</code></p>
-    <p class="muted">Short.io webhook route: <code>{{.WebhookRoutePattern}}</code></p>
-    <p class="muted">Use a unique route like <code>/webhooks/shortio/example.short.gy</code> or <code>/webhooks/shortio/short-domain-id</code> to target a specific mapping.</p>
-  </div>
-  <div class="card">
-    <h2>Sync mappings</h2>
-    <form method="post" action="/dashboard/mappings">
-      <div class="grid">
-        <label>Short.io domain or ID<br><input type="text" name="domain" placeholder="example.short.gy or short-domain-id"></label>
-        <label>Umami property ID<br><input type="text" name="property_id" placeholder="umami-property-id"></label>
+  <!-- Top navigation -->
+  <nav class="topnav">
+    <a class="nav-brand" href="/dashboard">
+      <div class="nav-icon">S</div>
+      <div>
+        <div class="nav-title">Short Umami Sync</div>
+        <div class="nav-sub">Analytics bridge</div>
       </div>
-      <p><button type="submit">Add mapping</button></p>
-    </form>
-    {{if .Mappings}}
-      {{range .Mappings}}
-        <div class="row-card">
-          <form method="post" action="/dashboard/mappings">
-            <input type="hidden" name="original_domain" value="{{.Domain}}">
-            <div class="grid">
-              <label>Short.io domain or ID<br><input type="text" name="domain" value="{{.Domain}}"></label>
-              <label>Umami property ID<br><input type="text" name="property_id" value="{{.PropertyID}}"></label>
-            </div>
-            <div class="row-actions">
-              <button type="submit">Save</button>
-              <span class="muted">Created {{.CreatedAt.Format "2006-01-02 15:04:05 MST"}} · Updated {{.UpdatedAt.Format "2006-01-02 15:04:05 MST"}}</span>
-            </div>
-          </form>
-          <form class="inline-actions" method="post" action="/dashboard/mappings/delete">
-            <input type="hidden" name="domain" value="{{.Domain}}">
-            <button type="submit">Delete</button>
-          </form>
-        </div>
-      {{end}}
-    {{else}}
-      <p class="muted">No mappings configured yet.</p>
+    </a>
+    <div class="nav-actions">
+      <a class="nav-link" href="/logout">Sign out</a>
+    </div>
+  </nav>
+
+  <div class="page">
+    <!-- Alerts -->
+    {{if .Message}}
+    <div class="alert alert-success">
+      <span class="alert-icon">✓</span>
+      <span>{{.Message}}</span>
+    </div>
     {{end}}
-  </div>
-  <div class="card">
-    <h2>Recent webhook events</h2>
-    {{if .Events}}
-      {{range .Events}}
-        <div class="card">
-          <div><strong>{{.Source}}</strong> — {{.ReceivedAt.Format "2006-01-02 15:04:05 MST"}}</div>
-          <div>Webhook key: <code>{{.WebhookKey}}</code></div>
-          <div>Payload domain: <code>{{.Domain}}</code></div>
-          <div>Property ID: <code>{{.PropertyID}}</code></div>
-          <div>Resolved from: {{.ResolvedFrom}}</div>
-          <div>Forwarded to Umami: {{.Forwarded}}</div>
-          {{if .ForwardError}}<div class="muted">{{.ForwardError}}</div>{{end}}
-          <pre>{{printf "%s" .Payload}}</pre>
-        </div>
-      {{end}}
-    {{else}}
-      <p class="muted">No events received yet.</p>
+    {{if .Error}}
+    <div class="alert alert-error">
+      <span class="alert-icon">✕</span>
+      <span>{{.Error}}</span>
+    </div>
     {{end}}
+
+    <!-- ── Umami Settings ── -->
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <div class="section-title">
+            <span class="icon icon-blue">⚙</span>
+            Umami Settings
+          </div>
+          <div class="section-desc">Configure the Umami endpoint and API token. Changes are persisted in the database.</div>
+        </div>
+        {{if .SettingsFromDB}}
+          <span class="badge badge-db">● Database</span>
+        {{else}}
+          <span class="badge badge-env">● Environment</span>
+        {{end}}
+      </div>
+      <div class="section-body">
+        <form method="post" action="/dashboard/settings">
+          <div class="grid-2">
+            <div class="field">
+              <label for="umami_endpoint">Umami Endpoint URL</label>
+              <input type="url" id="umami_endpoint" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://umami.example.com/api/send">
+              <div class="field-hint">The full URL of your Umami ingest endpoint.</div>
+            </div>
+            <div class="field">
+              <label for="umami_api_key">API Token</label>
+              <input type="text" id="umami_api_key" name="umami_api_key" value="{{.UmamiAPIKey}}" placeholder="Bearer token (optional)">
+              <div class="field-hint">Leave blank to keep the current token unchanged.</div>
+            </div>
+          </div>
+          <div style="margin-top:16px;">
+            <button class="btn btn-primary" type="submit">Save settings</button>
+          </div>
+        </form>
+        <div class="divider"></div>
+        <div class="info-row">
+          <span class="info-label">Fallback property ID</span>
+          <span class="info-value"><code>{{if .DefaultPropertyID}}{{.DefaultPropertyID}}{{else}}not set{{end}}</code></span>
+        </div>
+        <div class="info-row">
+          <span class="info-label">Webhook route pattern</span>
+          <span class="info-value"><code>{{.WebhookRoutePattern}}</code></span>
+        </div>
+        <div class="info-row" style="border-bottom:none; padding-bottom:0;">
+          <span class="info-label">Example webhook URL</span>
+          <span class="info-value"><code>/webhooks/shortio/example.short.gy</code></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Domain Mappings ── -->
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <div class="section-title">
+            <span class="icon icon-purple">⇄</span>
+            Domain Mappings
+          </div>
+          <div class="section-desc">Map Short.io domains or IDs to Umami property IDs.</div>
+        </div>
+      </div>
+      <div class="section-body">
+        <!-- Add new mapping -->
+        <form method="post" action="/dashboard/mappings" style="margin-bottom:20px;">
+          <div class="grid-2">
+            <div class="field">
+              <label>Short.io domain or ID</label>
+              <input type="text" name="domain" placeholder="example.short.gy">
+            </div>
+            <div class="field">
+              <label>Umami property ID</label>
+              <input type="text" name="property_id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+            </div>
+          </div>
+          <button class="btn btn-primary" type="submit">Add mapping</button>
+        </form>
+
+        {{if .Mappings}}
+          {{range .Mappings}}
+          <div class="mapping-row">
+            <form method="post" action="/dashboard/mappings">
+              <input type="hidden" name="original_domain" value="{{.Domain}}">
+              <div class="grid-2">
+                <div class="field">
+                  <label>Short.io domain or ID</label>
+                  <input type="text" name="domain" value="{{.Domain}}">
+                </div>
+                <div class="field">
+                  <label>Umami property ID</label>
+                  <input type="text" name="property_id" value="{{.PropertyID}}">
+                </div>
+              </div>
+              <div class="mapping-actions">
+                <button class="btn btn-secondary btn-sm" type="submit">Save changes</button>
+                <span class="mapping-meta">Created {{.CreatedAt.Format "Jan 2, 2006"}} · Updated {{.UpdatedAt.Format "Jan 2, 2006 15:04 MST"}}</span>
+              </div>
+            </form>
+            <form method="post" action="/dashboard/mappings/delete" style="margin-top:8px;">
+              <input type="hidden" name="domain" value="{{.Domain}}">
+              <button class="btn btn-danger btn-sm" type="submit">Delete</button>
+            </form>
+          </div>
+          {{end}}
+        {{else}}
+          <div class="empty-state">
+            <div class="empty-icon">⇄</div>
+            <p>No mappings configured yet. Add one above to get started.</p>
+          </div>
+        {{end}}
+      </div>
+    </div>
+
+    <!-- ── Recent Events ── -->
+    <div class="section">
+      <div class="section-header">
+        <div>
+          <div class="section-title">
+            <span class="icon icon-green">↻</span>
+            Recent Webhook Events
+          </div>
+          <div class="section-desc">Last 100 events received from Short.io webhooks.</div>
+        </div>
+        {{if .Events}}
+          <span class="badge badge-db" style="background:#f0fdf4;color:#15803d;border-color:#bbf7d0;">{{len .Events}} events</span>
+        {{end}}
+      </div>
+      <div class="section-body">
+        {{if .Events}}
+          {{range .Events}}
+          <div class="event-card">
+            <div class="event-header">
+              <span class="event-source">{{.Source}}</span>
+              <span class="event-time">{{.ReceivedAt.Format "Jan 2, 2006 15:04:05 MST"}}</span>
+              {{if .Forwarded}}
+                <span class="status-badge status-ok">✓ Forwarded</span>
+              {{else if .ForwardError}}
+                <span class="status-badge status-err">✕ Failed</span>
+              {{else}}
+                <span class="status-badge status-pending">⏸ Pending</span>
+              {{end}}
+            </div>
+            <div class="event-fields">
+              <div class="event-field">
+                <div class="event-field-label">Webhook key</div>
+                <div class="event-field-value"><code>{{if .WebhookKey}}{{.WebhookKey}}{{else}}—{{end}}</code></div>
+              </div>
+              <div class="event-field">
+                <div class="event-field-label">Payload domain</div>
+                <div class="event-field-value"><code>{{if .Domain}}{{.Domain}}{{else}}—{{end}}</code></div>
+              </div>
+              <div class="event-field">
+                <div class="event-field-label">Property ID</div>
+                <div class="event-field-value"><code>{{if .PropertyID}}{{.PropertyID}}{{else}}—{{end}}</code></div>
+              </div>
+              <div class="event-field">
+                <div class="event-field-label">Resolved from</div>
+                <div class="event-field-value">{{if .ResolvedFrom}}{{.ResolvedFrom}}{{else}}—{{end}}</div>
+              </div>
+            </div>
+            {{if .ForwardError}}
+              <div class="event-error">Error: {{.ForwardError}}</div>
+            {{end}}
+            <details>
+              <summary>View raw payload</summary>
+              <pre>{{printf "%s" .Payload}}</pre>
+            </details>
+          </div>
+          {{end}}
+        {{else}}
+          <div class="empty-state">
+            <div class="empty-icon">↻</div>
+            <p>No events received yet. Configure a Short.io webhook to get started.</p>
+          </div>
+        {{end}}
+      </div>
+    </div>
   </div>
 </body>
 </html>`
