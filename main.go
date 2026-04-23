@@ -680,109 +680,93 @@ const loginTemplate = `<!doctype html>
   <style>
     :root {
       color-scheme: light;
-      --bg: #f6f8fb;
+      --bg: #f5f7fa;
       --surface: rgba(255, 255, 255, 0.92);
-      --surface-strong: #ffffff;
-      --border: rgba(148, 163, 184, 0.22);
-      --border-strong: rgba(148, 163, 184, 0.35);
+      --border: rgba(15, 23, 42, 0.08);
       --text: #0f172a;
       --muted: #64748b;
-      --primary: #0f766e;
-      --primary-strong: #115e59;
-      --danger: #b91c1c;
-      --shadow: 0 24px 70px rgba(15, 23, 42, 0.08);
-      --radius: 20px;
+      --accent-2: #115e59;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      color: var(--text);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(45, 212, 191, 0.18), transparent 30%),
-        radial-gradient(circle at top right, rgba(96, 165, 250, 0.16), transparent 28%),
-        linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
       display: grid;
       place-items: center;
-      padding: 32px 16px;
+      padding: 24px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(45, 212, 191, 0.12), transparent 24%),
+        linear-gradient(180deg, #f8fafc 0%, #edf2f7 100%);
     }
-    .shell {
-      width: min(100%, 480px);
+    .panel {
+      width: min(100%, 420px);
+      padding: 28px;
+      border-radius: 24px;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 24px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(14px);
-      padding: 34px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.08);
     }
     .eyebrow {
       display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 12px;
+      padding: 7px 10px;
       border-radius: 999px;
-      background: rgba(15, 118, 110, 0.08);
-      color: var(--primary-strong);
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
+      font-size: 11px;
+      letter-spacing: .08em;
       text-transform: uppercase;
-      margin-bottom: 18px;
+      font-weight: 700;
+      color: var(--accent-2);
+      background: rgba(15, 118, 110, 0.08);
+      margin-bottom: 14px;
     }
-    h1 { margin: 0 0 8px; font-size: 32px; letter-spacing: -0.03em; }
-    p { margin: 0; color: var(--muted); line-height: 1.6; }
-    .stack { display: grid; gap: 18px; margin-top: 28px; }
-    label { display: grid; gap: 8px; font-size: 14px; font-weight: 600; color: #334155; }
+    h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -0.03em; }
+    p { margin: 0; color: var(--muted); line-height: 1.55; }
+    form { margin-top: 24px; display: grid; gap: 12px; }
+    label { display: grid; gap: 8px; font-size: 13px; font-weight: 600; color: #334155; }
     input {
       width: 100%;
-      border: 1px solid var(--border-strong);
+      padding: 13px 14px;
       border-radius: 14px;
-      background: var(--surface-strong);
-      padding: 14px 16px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: white;
       font: inherit;
       color: var(--text);
       outline: none;
-      transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
     }
-    input:focus {
-      border-color: rgba(15, 118, 110, 0.5);
-      box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12);
-    }
+    input:focus { border-color: rgba(15, 118, 110, 0.5); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
     button {
       border: 0;
       border-radius: 14px;
+      padding: 12px 16px;
       background: linear-gradient(180deg, #14b8a6, #0f766e);
       color: white;
       font: inherit;
       font-weight: 700;
-      padding: 13px 18px;
       cursor: pointer;
-      box-shadow: 0 10px 20px rgba(15, 118, 110, 0.18);
     }
-    button:hover { background: linear-gradient(180deg, #10b5a2, #115e59); }
     .error {
+      margin-top: 14px;
       padding: 12px 14px;
-      background: rgba(185, 28, 28, 0.08);
-      border: 1px solid rgba(185, 28, 28, 0.16);
-      color: var(--danger);
       border-radius: 14px;
+      background: rgba(185, 28, 28, 0.08);
+      color: #b91c1c;
       font-size: 14px;
-      margin-top: 18px;
     }
   </style>
 </head>
 <body>
-  <main class="shell">
+  <main class="panel">
     <div class="eyebrow">Short Umami Sync</div>
-    <h1>Welcome back</h1>
-    <p>Sign in to manage mappings, update Umami settings, and review recent webhook activity.</p>
+    <h1>Sign in</h1>
+    <p>Manage the settings, mappings, and activity feed.</p>
     {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-    <form class="stack" method="post" action="/login">
+    <form method="post" action="/login">
       <label>Password
         <input type="password" name="password" autofocus>
       </label>
-      <button type="submit">Sign in</button>
+      <button type="submit">Continue</button>
     </form>
   </main>
 </body>
@@ -797,265 +781,221 @@ const dashboardTemplate = `<!doctype html>
   <style>
     :root {
       color-scheme: light;
-      --bg: #f3f6fa;
+      --bg: #f5f7fa;
       --surface: rgba(255, 255, 255, 0.9);
-      --surface-strong: #ffffff;
-      --border: rgba(148, 163, 184, 0.22);
-      --border-strong: rgba(148, 163, 184, 0.36);
+      --surface-2: #ffffff;
+      --border: rgba(15, 23, 42, 0.08);
       --text: #0f172a;
       --muted: #64748b;
-      --muted-soft: #94a3b8;
-      --primary: #0f766e;
-      --primary-strong: #115e59;
+      --accent-2: #115e59;
       --danger: #b91c1c;
-      --success: #15803d;
-      --shadow: 0 24px 70px rgba(15, 23, 42, 0.08);
-      --radius: 20px;
     }
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
     body {
       margin: 0;
       min-height: 100vh;
-      color: var(--text);
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
       background:
-        radial-gradient(circle at top left, rgba(45, 212, 191, 0.18), transparent 28%),
-        radial-gradient(circle at top right, rgba(96, 165, 250, 0.12), transparent 24%),
-        linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+        radial-gradient(circle at top left, rgba(45, 212, 191, 0.12), transparent 24%),
+        linear-gradient(180deg, #f8fafc 0%, #edf2f7 100%);
     }
-    a { color: inherit; }
+    a { color: inherit; text-decoration: none; }
     code {
-      padding: 0.2rem 0.45rem;
+      padding: 0.18rem 0.45rem;
       border-radius: 999px;
       background: rgba(15, 23, 42, 0.05);
-      color: #0f172a;
-      font-size: 0.92em;
       word-break: break-word;
+      font-size: .92em;
     }
-    .page {
-      width: min(1180px, calc(100% - 32px));
-      margin: 24px auto 40px;
-    }
+    .page { width: min(1120px, calc(100% - 28px)); margin: 22px auto 36px; }
     .topbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 16px;
-      margin-bottom: 22px;
+      align-items: start;
+      margin-bottom: 16px;
     }
-    .hero {
-      flex: 1;
+    .hero, .card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 28px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(14px);
-      padding: 26px 28px;
+      border-radius: 24px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 22px 60px rgba(15, 23, 42, 0.06);
     }
+    .hero { padding: 24px 24px 20px; }
     .eyebrow {
       display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 12px;
+      padding: 7px 10px;
       border-radius: 999px;
-      background: rgba(15, 118, 110, 0.08);
-      color: var(--primary-strong);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.08em;
+      font-size: 11px;
+      letter-spacing: .08em;
       text-transform: uppercase;
+      font-weight: 700;
+      color: var(--accent-2);
+      background: rgba(15, 118, 110, 0.08);
       margin-bottom: 14px;
     }
-    h1, h2, h3 { margin: 0; letter-spacing: -0.03em; }
+    h1, h2 { margin: 0; letter-spacing: -0.03em; }
     h1 { font-size: 34px; line-height: 1.05; }
-    .subtitle { margin: 10px 0 0; color: var(--muted); font-size: 15px; line-height: 1.6; max-width: 72ch; }
-    .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
-    .button-link {
+    h2 { font-size: 17px; }
+    p { margin: 0; }
+    .subtitle { margin-top: 10px; max-width: 72ch; color: var(--muted); line-height: 1.55; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .btn, button {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 42px;
-      padding: 0 16px;
+      min-height: 40px;
+      padding: 0 14px;
       border-radius: 12px;
-      border: 1px solid var(--border-strong);
-      background: var(--surface-strong);
-      text-decoration: none;
-      font-weight: 700;
-      color: #0f172a;
-      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.04);
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      background: var(--surface-2);
+      color: var(--text);
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
     }
-    .button-link.primary {
-      border-color: transparent;
-      color: white;
+    .btn.primary, button.primary {
       background: linear-gradient(180deg, #14b8a6, #0f766e);
-      box-shadow: 0 10px 20px rgba(15, 118, 110, 0.18);
+      color: white;
+      border-color: transparent;
     }
     .notice {
-      margin: 16px 0 0;
-      padding: 14px 16px;
-      border-radius: 16px;
-      border: 1px solid transparent;
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 14px;
       font-size: 14px;
-      line-height: 1.5;
+      line-height: 1.45;
     }
-    .notice.success { background: rgba(21, 128, 61, 0.08); border-color: rgba(21, 128, 61, 0.15); color: var(--success); }
-    .notice.error { background: rgba(185, 28, 28, 0.08); border-color: rgba(185, 28, 28, 0.15); color: var(--danger); }
-    .grid {
-      display: grid;
-      gap: 18px;
-      margin-top: 18px;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
-    }
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(14px);
-      padding: 22px;
-    }
-    .card h2 {
-      font-size: 18px;
-      margin-bottom: 10px;
-    }
-    .card-head {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 18px;
-    }
-    .muted { color: var(--muted); }
-    .muted-soft { color: var(--muted-soft); }
-    .config { grid-column: span 12; }
-    .settings { grid-column: span 12; }
-    .mappings { grid-column: span 12; }
-    .events { grid-column: span 12; }
-    @media (min-width: 1060px) {
-      .settings { grid-column: span 5; }
-      .mappings { grid-column: span 7; }
-      .events { grid-column: span 12; }
-    }
-    .chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+    .notice.success { background: rgba(21, 128, 61, 0.08); color: #15803d; }
+    .notice.error { background: rgba(185, 28, 28, 0.08); color: var(--danger); }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
     .chip {
       display: inline-flex;
-      align-items: center;
       gap: 8px;
-      padding: 9px 12px;
+      align-items: center;
+      padding: 8px 10px;
       border-radius: 999px;
       background: rgba(15, 23, 42, 0.04);
-      border: 1px solid rgba(148, 163, 184, 0.16);
       color: #334155;
       font-size: 13px;
-      font-weight: 600;
+      border: 1px solid rgba(148, 163, 184, 0.16);
     }
-    .chip strong { color: #0f172a; }
-    .form-grid {
+    .chip strong { color: var(--text); }
+    .grid {
       display: grid;
-      gap: 14px;
-      grid-template-columns: 1fr;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 16px;
     }
-    @media (min-width: 760px) {
-      .form-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card { padding: 20px; }
+    .settings, .mappings, .events { grid-column: span 12; }
+    @media (min-width: 1040px) {
+      .settings { grid-column: span 4; }
+      .mappings { grid-column: span 8; }
     }
-    label { display: grid; gap: 8px; font-size: 13px; font-weight: 700; color: #334155; }
-    .hint { font-size: 12px; color: var(--muted); font-weight: 500; line-height: 1.4; }
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .muted { color: var(--muted); }
+    .tiny { font-size: 12px; }
+    .form { display: grid; gap: 12px; }
+    label {
+      display: grid;
+      gap: 7px;
+      font-size: 13px;
+      font-weight: 650;
+      color: #334155;
+    }
     input {
       width: 100%;
-      border: 1px solid var(--border-strong);
+      padding: 12px 13px;
       border-radius: 14px;
-      background: var(--surface-strong);
-      padding: 13px 14px;
+      border: 1px solid rgba(148, 163, 184, 0.32);
+      background: white;
       font: inherit;
       color: var(--text);
       outline: none;
-      transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
     }
-    input:focus {
-      border-color: rgba(15, 118, 110, 0.5);
-      box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12);
+    input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+    .mapping {
+      display: grid;
+      gap: 14px;
+      padding: 14px 0;
+      border-top: 1px solid rgba(148, 163, 184, 0.14);
     }
-    .button-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-top: 16px;
-      flex-wrap: wrap;
-    }
-    button {
-      border: 0;
-      border-radius: 14px;
-      background: linear-gradient(180deg, #14b8a6, #0f766e);
-      color: white;
-      font: inherit;
-      font-weight: 700;
-      padding: 12px 16px;
-      cursor: pointer;
-      box-shadow: 0 10px 20px rgba(15, 118, 110, 0.16);
-    }
-    button.secondary {
-      background: var(--surface-strong);
-      color: #0f172a;
-      border: 1px solid var(--border-strong);
-      box-shadow: none;
-    }
-    table { width: 100%; border-collapse: collapse; }
-    th, td {
-      text-align: left;
-      vertical-align: top;
-      padding: 14px 12px;
-      border-bottom: 1px solid rgba(148, 163, 184, 0.18);
-      font-size: 14px;
-    }
-    th { color: var(--muted); font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
-    tr:last-child td { border-bottom: 0; }
-    .inline { display: inline; }
-    .event {
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.7);
-      padding: 18px;
-      margin-top: 14px;
-    }
-    .event-head {
+    .mapping:first-child { border-top: 0; padding-top: 0; }
+    .mapping-top {
       display: flex;
       justify-content: space-between;
+      gap: 14px;
       align-items: flex-start;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-    .event-meta {
-      display: flex;
-      gap: 10px;
       flex-wrap: wrap;
-      margin-top: 8px;
     }
+    .mapping-title { font-weight: 700; }
+    .mapping-url {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .secondary {
+      background: transparent;
+      border-color: rgba(148, 163, 184, 0.28);
+      color: #334155;
+    }
+    .events-list { display: grid; gap: 10px; }
+    .event {
+      padding: 14px 0 0;
+      border-top: 1px solid rgba(148, 163, 184, 0.14);
+    }
+    .event:first-child { border-top: 0; padding-top: 0; }
+    .event-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
     .badge {
       display: inline-flex;
-      align-items: center;
-      gap: 6px;
       padding: 7px 10px;
       border-radius: 999px;
       background: rgba(15, 118, 110, 0.08);
-      color: var(--primary-strong);
+      color: var(--accent-2);
       font-size: 12px;
       font-weight: 700;
     }
     pre {
-      overflow: auto;
-      margin: 14px 0 0;
+      margin: 12px 0 0;
       padding: 14px;
       border-radius: 16px;
       background: #0b1120;
       color: #d9e2f2;
-      font-size: 12px;
-      line-height: 1.6;
+      overflow: auto;
       white-space: pre-wrap;
       word-break: break-word;
+      font-size: 12px;
+      line-height: 1.55;
     }
   </style>
+  <script>
+    async function copyWebhook(url, button) {
+      try {
+        await navigator.clipboard.writeText(url);
+        const previous = button.textContent;
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = previous; }, 1200);
+      } catch (error) {
+        button.textContent = 'Copy failed';
+        setTimeout(() => { button.textContent = 'Copy Webhook'; }, 1200);
+      }
+    }
+  </script>
 </head>
 <body>
   <main class="page">
@@ -1063,149 +1003,125 @@ const dashboardTemplate = `<!doctype html>
       <section class="hero">
         <div class="eyebrow">Short Umami Sync</div>
         <h1>Dashboard</h1>
-        <p class="subtitle">Manage Umami forwarding settings, map Short.io domains to Umami properties, and review webhook traffic in one clean workspace.</p>
+        <p class="subtitle">Keep the Umami endpoint, token, and fallback site ID in one place. Map each Short.io domain to a webhook URL and review recent activity.</p>
         <div class="chips">
           <span class="chip"><strong>Endpoint</strong> {{if .UmamiEndpoint}}{{.UmamiEndpoint}}{{else}}not set{{end}}</span>
-          <span class="chip"><strong>API token</strong> {{if .UmamiAPIKey}}configured{{else}}not set{{end}}</span>
-          <span class="chip"><strong>Fallback property</strong> {{if .DefaultPropertyID}}{{.DefaultPropertyID}}{{else}}not set{{end}}</span>
+          <span class="chip"><strong>Token</strong> {{if .UmamiAPIKey}}set{{else}}not set{{end}}</span>
+          <span class="chip"><strong>Fallback Site ID</strong> {{if .DefaultPropertyID}}{{.DefaultPropertyID}}{{else}}not set{{end}}</span>
         </div>
         {{if .Message}}<div class="notice success">{{.Message}}</div>{{end}}
         {{if .Error}}<div class="notice error">{{.Error}}</div>{{end}}
       </section>
       <div class="actions">
-        <a class="button-link primary" href="#settings">Settings</a>
-        <a class="button-link" href="#mappings">Mappings</a>
-        <a class="button-link" href="#events">Events</a>
-        <a class="button-link" href="/logout">Log out</a>
+        <a class="btn primary" href="#settings">Settings</a>
+        <a class="btn" href="#mappings">Mappings</a>
+        <a class="btn" href="#events">Events</a>
+        <a class="btn" href="/logout">Log out</a>
       </div>
     </div>
 
     <section class="grid">
-      <article class="card config">
-        <div class="card-head">
-          <div>
-            <h2>Configuration</h2>
-            <p class="muted">The app uses the saved settings below when forwarding Short.io webhooks to Umami.</p>
-          </div>
-        </div>
-        <div class="form-grid cols-2">
-          <div>
-            <div class="hint">Short.io webhook endpoint</div>
-            <code>/webhooks/shortio</code>
-          </div>
-          <div>
-            <div class="hint">Domain mappings override the fallback property ID on a per-domain basis.</div>
-            <code>domain_mappings</code>
-          </div>
-        </div>
-      </article>
-
       <article class="card settings" id="settings">
-        <div class="card-head">
+        <div class="section-head">
           <div>
-            <h2>Umami settings</h2>
-            <p class="muted">Update the destination endpoint, API token, and fallback property here.</p>
+            <h2>Settings</h2>
+            <p class="muted tiny">Saved to Postgres and applied immediately.</p>
           </div>
         </div>
-        <form method="post" action="/dashboard/settings">
-          <div class="form-grid">
-            <label>Umami Endpoint
-              <input type="url" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://analytics.example.com/api/send">
-              <span class="hint">The POST target for forwarded events.</span>
-            </label>
-            <label>API Token
-              <input type="text" name="umami_api_key" value="{{.UmamiAPIKey}}" placeholder="optional bearer token">
-              <span class="hint">Stored securely in the service database and sent as a Bearer token when set.</span>
-            </label>
-            <label>Fallback property ID
-              <input type="text" name="umami_website_id" value="{{.DefaultPropertyID}}" placeholder="umami-property-id">
-              <span class="hint">Used when a webhook domain does not have a dedicated mapping.</span>
-            </label>
-          </div>
-          <div class="button-row">
-            <span class="muted">Changes apply immediately to new webhook requests.</span>
-            <button type="submit">Save settings</button>
+        <form class="form" method="post" action="/dashboard/settings">
+          <label>Umami Endpoint
+            <input type="url" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://analytics.example.com/api/send">
+          </label>
+          <label>Umami API Token
+            <input type="text" name="umami_api_key" value="{{.UmamiAPIKey}}" placeholder="optional bearer token">
+          </label>
+          <label>Fallback Site ID
+            <input type="text" name="umami_website_id" value="{{.DefaultPropertyID}}" placeholder="umami-site-id">
+          </label>
+          <div class="toolbar">
+            <span class="muted tiny">Used when a mapping doesn\u2019t exist.</span>
+            <button class="primary" type="submit">Save</button>
           </div>
         </form>
       </article>
 
       <article class="card mappings" id="mappings">
-        <div class="card-head">
+        <div class="section-head">
           <div>
-            <h2>Domain-to-property mappings</h2>
-            <p class="muted">Override the fallback property for specific Short.io domains.</p>
+            <h2>Mappings</h2>
+            <p class="muted tiny">Each domain gets its own webhook URL.</p>
           </div>
         </div>
-        <form method="post" action="/dashboard/mappings">
-          <div class="form-grid cols-2">
+        <form class="form" method="post" action="/dashboard/mappings">
+          <div style="display:grid; gap:12px; grid-template-columns: repeat(2, minmax(0, 1fr));">
             <label>Short.io domain
               <input type="text" name="domain" placeholder="example.short.gy">
             </label>
-            <label>Umami property ID
-              <input type="text" name="property_id" placeholder="umami-property-id">
+            <label>Umami Site ID
+              <input type="text" name="property_id" placeholder="umami-site-id">
             </label>
           </div>
-          <div class="button-row">
-            <span class="muted">Domains are normalized before saving.</span>
-            <button type="submit">Save mapping</button>
+          <div class="toolbar">
+            <span class="muted tiny">Domains are normalized before saving.</span>
+            <button class="primary" type="submit">Add mapping</button>
           </div>
         </form>
-        <div style="margin-top: 18px; overflow-x: auto;">
-          <table>
-            <thead>
-              <tr><th>Domain</th><th>Property ID</th><th>Updated</th><th></th></tr>
-            </thead>
-            <tbody>
-              {{if .Mappings}}
-                {{range .Mappings}}
-                  <tr>
-                    <td><code>{{.Domain}}</code></td>
-                    <td><code>{{.PropertyID}}</code></td>
-                    <td class="muted">{{.UpdatedAt.Format "2006-01-02 15:04:05 MST"}}</td>
-                    <td>
-                      <form class="inline" method="post" action="/dashboard/mappings/delete">
-                        <input type="hidden" name="domain" value="{{.Domain}}">
-                        <button class="secondary" type="submit">Delete</button>
-                      </form>
-                    </td>
-                  </tr>
-                {{end}}
-              {{else}}
-                <tr><td colspan="4" class="muted">No mappings configured yet.</td></tr>
-              {{end}}
-            </tbody>
-          </table>
+
+        <div class="events-list" style="margin-top: 16px;">
+          {{if .Mappings}}
+            {{range .Mappings}}
+              <div class="mapping">
+                <div class="mapping-top">
+                  <div>
+                    <div class="mapping-title"><code>{{.Domain}}</code></div>
+                    <div class="mapping-url">
+                      <span>{{printf "https://short-umami-sync-production.up.railway.app/webhooks/shortio/%s" .Domain}}</span>
+                      <button class="secondary" type="button" onclick="copyWebhook('{{printf "https://short-umami-sync-production.up.railway.app/webhooks/shortio/%s" .Domain}}', this)">Copy Webhook</button>
+                    </div>
+                  </div>
+                  <div class="row-actions">
+                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}\u2014{{end}}</span>
+                    <span class="chip"><strong>Updated</strong> {{.UpdatedAt.Format "2006-01-02 15:04 MST"}}</span>
+                  </div>
+                </div>
+              </div>
+            {{end}}
+          {{else}}
+            <p class="muted tiny">No mappings yet.</p>
+          {{end}}
         </div>
       </article>
 
       <article class="card events" id="events">
-        <div class="card-head">
+        <div class="section-head">
           <div>
-            <h2>Recent webhook events</h2>
-            <p class="muted">The latest payloads received by the service, including forwarding status.</p>
+            <h2>Events</h2>
+            <p class="muted tiny">Recent webhook activity.</p>
           </div>
         </div>
-        {{if .Events}}
-          {{range .Events}}
-            <div class="event">
-              <div class="event-head">
-                <div>
-                  <div class="badge">{{.Source}}</div>
-                  <div style="margin-top: 10px; font-weight: 700; font-size: 15px;">{{.ReceivedAt.Format "2006-01-02 15:04:05 MST"}}</div>
-                  <div class="event-meta">
-                    <span class="chip"><strong>Domain</strong> {{if .Domain}}{{.Domain}}{{else}}—{{end}}</span>
-                    <span class="chip"><strong>Property ID</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}—{{end}}</span>
+        <div class="events-list">
+          {{if .Events}}
+            {{range .Events}}
+              <div class="event">
+                <div class="event-head">
+                  <div>
+                    <div class="badge">{{.Source}}</div>
+                    <div style="margin-top: 8px; font-weight: 700;">{{.ReceivedAt.Format "2006-01-02 15:04 MST"}}</div>
+                  </div>
+                  <div class="row-actions">
+                    <span class="chip"><strong>Domain</strong> {{if .Domain}}{{.Domain}}{{else}}\u2014{{end}}</span>
+                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}\u2014{{end}}</span>
                     <span class="chip"><strong>Forwarded</strong> {{.Forwarded}}</span>
                   </div>
                 </div>
+                {{if .ForwardError}}<div class="notice error" style="margin-top:12px;">{{.ForwardError}}</div>{{end}}
+                <pre>{{printf "%s" .Payload}}</pre>
               </div>
-              {{if .ForwardError}}<div class="notice error" style="margin-top: 0;">{{.ForwardError}}</div>{{end}}
-              <pre>{{printf "%s" .Payload}}</pre>
-            </div>
+            {{end}}
+          {{else}}
+            <p class="muted tiny">No events received yet.</p>
           {{end}}
-        {{else}}
-          <p class="muted">No events received yet.</p>
-        {{end}}
+        </div>
       </article>
     </section>
   </main>
