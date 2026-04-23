@@ -44,11 +44,13 @@ type app struct {
 	password         string
 	sessionSecret    string
 	settingsMu       sync.RWMutex
+	mappingsMu       sync.RWMutex
 	umamiEndpoint    string
 	umamiAPIKey      string
 	umamiDefaultProp string
 	mu               sync.Mutex
 	events           []Event
+	mappings         []Mapping
 	tmplLogin        *template.Template
 	tmplDash         *template.Template
 }
@@ -104,13 +106,25 @@ func mustNewApp() *app {
 		log.Fatal(err)
 	}
 
-	storedSettings, err := loadSettings(ctx, db)
+storedSettings, err := loadSettings(ctx, db)
 	if err != nil {
 		log.Fatal(err)
 	}
 	events, err := loadPersistedEvents()
 	if err != nil {
 		log.Printf("failed to load persisted events: %v", err)
+	}
+	mappings, err := loadPersistedMappings()
+	if err != nil {
+		log.Printf("failed to load persisted mappings: %v", err)
+	}
+	if len(mappings) == 0 {
+		mappings, err = loadMappingsFromDB(ctx, db)
+		if err != nil {
+			log.Printf("failed to load mappings from database: %v", err)
+		} else if err := persistMappings(mappings); err != nil {
+			log.Printf("failed to persist mappings cache: %v", err)
+		}
 	}
 
 	return &app{
@@ -121,6 +135,7 @@ func mustNewApp() *app {
 		umamiAPIKey:      settingOrEnvAny(storedSettings, "umami_api_key", "UMAMI_API_TOKEN", "UMAMI_API_KEY"),
 		umamiDefaultProp: settingOrEnvAny(storedSettings, "umami_website_id", "FALLBACK_SITE_ID", "UMAMI_WEBSITE_ID"),
 		events:           events,
+		mappings:         mappings,
 		tmplLogin:        template.Must(template.New("login").Parse(loginTemplate)),
 		tmplDash:         template.Must(template.New("dashboard").Parse(dashboardTemplate)),
 	}
@@ -543,9 +558,17 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 }
 
 func (a *app) listMappings(ctx context.Context) ([]Mapping, error) {
+	a.mappingsMu.RLock()
+	defer a.mappingsMu.RUnlock()
+	mappings := make([]Mapping, len(a.mappings))
+	copy(mappings, a.mappings)
+	return mappings, nil
+}
+
+func loadMappingsFromDB(ctx context.Context, db *sql.DB) ([]Mapping, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	rows, err := a.db.QueryContext(queryCtx, `
+	rows, err := db.QueryContext(queryCtx, `
 		SELECT domain, property_id, created_at, updated_at
 		FROM domain_mappings
 		ORDER BY domain ASC
@@ -570,21 +593,14 @@ func (a *app) listMappings(ctx context.Context) ([]Mapping, error) {
 }
 
 func (a *app) getMapping(ctx context.Context, domain string) (string, error) {
-	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	var propertyID string
-	err := a.db.QueryRowContext(queryCtx, `
-		SELECT property_id
-		FROM domain_mappings
-		WHERE domain = $1
-	`, domain).Scan(&propertyID)
-	if err == sql.ErrNoRows {
-		return "", nil
+	a.mappingsMu.RLock()
+	defer a.mappingsMu.RUnlock()
+	for _, mapping := range a.mappings {
+		if mapping.Domain == domain {
+			return mapping.PropertyID, nil
+		}
 	}
-	if err != nil {
-		return "", err
-	}
-	return propertyID, nil
+	return "", nil
 }
 
 func (a *app) upsertMapping(ctx context.Context, domain, propertyID string) error {
@@ -596,15 +612,91 @@ func (a *app) upsertMapping(ctx context.Context, domain, propertyID string) erro
 		ON CONFLICT (domain)
 		DO UPDATE SET property_id = EXCLUDED.property_id, updated_at = now()
 	`, domain, propertyID)
-	return err
+	if err != nil {
+		return err
+	}
+	a.mappingsMu.Lock()
+	defer a.mappingsMu.Unlock()
+	now := time.Now().UTC()
+	updated := false
+	for i := range a.mappings {
+		if a.mappings[i].Domain == domain {
+			a.mappings[i].PropertyID = propertyID
+			a.mappings[i].UpdatedAt = now
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		a.mappings = append(a.mappings, Mapping{Domain: domain, PropertyID: propertyID, CreatedAt: now, UpdatedAt: now})
+	}
+	return persistMappings(a.mappings)
 }
 
 func (a *app) deleteMapping(ctx context.Context, domain string) error {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_, err := a.db.ExecContext(queryCtx, `DELETE FROM domain_mappings WHERE domain = $1`, domain)
-	return err
+	if err != nil {
+		return err
+	}
+	a.mappingsMu.Lock()
+	defer a.mappingsMu.Unlock()
+	filtered := make([]Mapping, 0, len(a.mappings))
+	for _, m := range a.mappings {
+		if m.Domain != domain {
+			filtered = append(filtered, m)
+		}
+	}
+	a.mappings = filtered
+	return persistMappings(a.mappings)
 }
+
+func loadPersistedMappings() ([]Mapping, error) {
+	data, err := os.ReadFile(mappingsFilePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil, nil
+	}
+	var mappings []Mapping
+	if err := json.Unmarshal(data, &mappings); err != nil {
+		return nil, err
+	}
+	return mappings, nil
+}
+
+func persistMappings(mappings []Mapping) error {
+	if err := os.MkdirAll("/data", 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("/data", "mappings-*.json")
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(mappings); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), mappingsFilePath()); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
+}
+
+func mappingsFilePath() string { return "/data/mappings.json" }
 
 const sessionCookieName = "short_umami_session"
 
