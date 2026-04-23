@@ -54,6 +54,7 @@ type app struct {
 }
 
 func main() {
+	setupPersistentLogging()
 	cfg := mustNewApp()
 
 	mux := http.NewServeMux()
@@ -107,14 +108,19 @@ func mustNewApp() *app {
 	if err != nil {
 		log.Fatal(err)
 	}
+	events, err := loadPersistedEvents()
+	if err != nil {
+		log.Printf("failed to load persisted events: %v", err)
+	}
 
 	return &app{
 		db:               db,
 		password:         envOr("APP_PASSWORD", "changeme"),
 		sessionSecret:    mustEnv("SESSION_SECRET"),
-		umamiEndpoint:    settingOrEnv(storedSettings, "umami_endpoint", "UMAMI_ENDPOINT"),
+		umamiEndpoint:    normalizeUmamiEndpoint(settingOrEnv(storedSettings, "umami_endpoint", "UMAMI_ENDPOINT")),
 		umamiAPIKey:      settingOrEnv(storedSettings, "umami_api_key", "UMAMI_API_KEY"),
 		umamiDefaultProp: settingOrEnv(storedSettings, "umami_website_id", "UMAMI_WEBSITE_ID"),
+		events:           events,
 		tmplLogin:        template.Must(template.New("login").Parse(loginTemplate)),
 		tmplDash:         template.Must(template.New("dashboard").Parse(dashboardTemplate)),
 	}
@@ -170,6 +176,17 @@ func settingOrEnv(settings map[string]string, key, envKey string) string {
 		return value
 	}
 	return os.Getenv(envKey)
+}
+
+func normalizeUmamiEndpoint(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if !strings.Contains(value, "://") {
+		value = "https://" + value
+	}
+	return strings.TrimRight(value, " ")
 }
 
 func mustEnv(key string) string {
@@ -303,7 +320,7 @@ func (a *app) settingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	endpoint := strings.TrimSpace(r.FormValue("umami_endpoint"))
+	endpoint := normalizeUmamiEndpoint(strings.TrimSpace(r.FormValue("umami_endpoint")))
 	apiKey := strings.TrimSpace(r.FormValue("umami_api_key"))
 	defaultPropertyID := strings.TrimSpace(r.FormValue("umami_website_id"))
 
@@ -343,12 +360,13 @@ func (a *app) settingsSnapshot() runtimeSettings {
 func (a *app) setSettings(endpoint, apiKey, defaultPropertyID string) {
 	a.settingsMu.Lock()
 	defer a.settingsMu.Unlock()
-	a.umamiEndpoint = endpoint
+	a.umamiEndpoint = normalizeUmamiEndpoint(endpoint)
 	a.umamiAPIKey = apiKey
 	a.umamiDefaultProp = defaultPropertyID
 }
 
 func (a *app) saveSettings(ctx context.Context, endpoint, apiKey, defaultPropertyID string) error {
+	endpoint = normalizeUmamiEndpoint(endpoint)
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_, err := a.db.ExecContext(queryCtx, `
@@ -362,6 +380,52 @@ func (a *app) saveSettings(ctx context.Context, endpoint, apiKey, defaultPropert
 	`, endpoint, apiKey, defaultPropertyID)
 	return err
 }
+
+func loadPersistedEvents() ([]Event, error) {
+	data, err := os.ReadFile(eventsFilePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil, nil
+	}
+	var events []Event
+	if err := json.Unmarshal(data, &events); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+func persistEvents(events []Event) error {
+	if err := os.MkdirAll("/data", 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("/data", "events-*.json")
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(tmp)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(events); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), eventsFilePath()); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
+}
+
+func eventsFilePath() string { return "/data/events.json" }
 
 func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -393,7 +457,12 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if len(a.events) > 100 {
 		a.events = a.events[len(a.events)-100:]
 	}
+	eventsSnapshot := make([]Event, len(a.events))
+	copy(eventsSnapshot, a.events)
 	a.mu.Unlock()
+	if err := persistEvents(eventsSnapshot); err != nil {
+		log.Printf("failed to persist events: %v", err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": event.Forwarded, "error": event.ForwardError, "domain": domain, "property_id": propertyID})
 }
@@ -415,6 +484,7 @@ func (a *app) resolvePropertyID(ctx context.Context, domain, defaultPropertyID s
 }
 
 func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, propertyID, resolvedFrom, endpoint, apiKey string) (bool, string) {
+	endpoint = normalizeUmamiEndpoint(endpoint)
 	if endpoint == "" {
 		return false, "UMAMI_ENDPOINT is not configured"
 	}
@@ -669,6 +739,20 @@ func domainFromString(raw string) string {
 		return ""
 	}
 	return value
+}
+
+func setupPersistentLogging() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
+	if err := os.MkdirAll("/data", 0o755); err != nil {
+		log.Printf("failed to create /data for logs: %v", err)
+		return
+	}
+	file, err := os.OpenFile("/data/short-umami-sync.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("failed to open persistent log file: %v", err)
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, file))
 }
 
 const loginTemplate = `<!doctype html>
@@ -1003,10 +1087,9 @@ const dashboardTemplate = `<!doctype html>
       <section class="hero">
         <div class="eyebrow">Short Umami Sync</div>
         <h1>Dashboard</h1>
-        <p class="subtitle">Keep the Umami endpoint, token, and fallback site ID in one place. Map each Short.io domain to a webhook URL and review recent activity.</p>
+        <p class="subtitle">Minimal settings for forwarding Short.io events to Umami. Enter a full collect URL such as <code>https://stats.brayden.me/bray</code>.</p>
         <div class="chips">
           <span class="chip"><strong>Endpoint</strong> {{if .UmamiEndpoint}}{{.UmamiEndpoint}}{{else}}not set{{end}}</span>
-          <span class="chip"><strong>Token</strong> {{if .UmamiAPIKey}}set{{else}}not set{{end}}</span>
           <span class="chip"><strong>Fallback Site ID</strong> {{if .DefaultPropertyID}}{{.DefaultPropertyID}}{{else}}not set{{end}}</span>
         </div>
         {{if .Message}}<div class="notice success">{{.Message}}</div>{{end}}
@@ -1030,7 +1113,8 @@ const dashboardTemplate = `<!doctype html>
         </div>
         <form class="form" method="post" action="/dashboard/settings">
           <label>Umami Endpoint
-            <input type="url" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://analytics.example.com/api/send">
+            <input type="text" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://stats.brayden.me/bray">
+            <span class="muted tiny">A path is allowed here; if you enter stats.brayden.me/bray, https:// is added automatically.</span>
           </label>
           <label>Umami API Token
             <input type="text" name="umami_api_key" value="{{.UmamiAPIKey}}" placeholder="optional bearer token">
