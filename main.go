@@ -118,8 +118,8 @@ func mustNewApp() *app {
 		password:         envOr("APP_PASSWORD", "changeme"),
 		sessionSecret:    mustEnv("SESSION_SECRET"),
 		umamiEndpoint:    normalizeUmamiEndpoint(settingOrEnv(storedSettings, "umami_endpoint", "UMAMI_ENDPOINT")),
-		umamiAPIKey:      settingOrEnv(storedSettings, "umami_api_key", "UMAMI_API_KEY"),
-		umamiDefaultProp: settingOrEnv(storedSettings, "umami_website_id", "UMAMI_WEBSITE_ID"),
+		umamiAPIKey:      settingOrEnvAny(storedSettings, "umami_api_key", "UMAMI_API_TOKEN", "UMAMI_API_KEY"),
+		umamiDefaultProp: settingOrEnvAny(storedSettings, "umami_website_id", "FALLBACK_SITE_ID", "UMAMI_WEBSITE_ID"),
 		events:           events,
 		tmplLogin:        template.Must(template.New("login").Parse(loginTemplate)),
 		tmplDash:         template.Must(template.New("dashboard").Parse(dashboardTemplate)),
@@ -176,6 +176,18 @@ func settingOrEnv(settings map[string]string, key, envKey string) string {
 		return value
 	}
 	return os.Getenv(envKey)
+}
+
+func settingOrEnvAny(settings map[string]string, key string, envKeys ...string) string {
+	if value, ok := settings[key]; ok {
+		return value
+	}
+	for _, envKey := range envKeys {
+		if value := strings.TrimSpace(os.Getenv(envKey)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func normalizeUmamiEndpoint(raw string) string {
