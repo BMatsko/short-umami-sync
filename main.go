@@ -623,45 +623,70 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		decoded = nil
 	}
 
-	hostname := domain
-	if hostname == "" && decoded != nil {
-		hostname = extractDomainValue(decoded)
+	metadata := extractShortioMetadata(decoded)
+
+	hostname := metadata.Hostname
+	if hostname == "" {
+		hostname = domain
 	}
 	if hostname == "" {
 		hostname = normalizeDomain(r.Host)
 	}
 
-	requestURL := "/"
-	if decoded != nil {
-		if rawURL := extractStringField(decoded, "url", "path", "slug", "pathname", "uri", "link"); rawURL != "" {
-			requestURL = rawURL
-		}
+	requestURL := metadata.Path
+	if requestURL == "" {
+		requestURL = "/"
 	}
 	if !strings.HasPrefix(requestURL, "/") {
 		requestURL = "/" + strings.TrimLeft(requestURL, "/")
 	}
 
-	eventName := "shortio-click"
-	if decoded != nil {
-		if rawName := extractStringField(decoded, "name", "event", "event_name", "action", "type"); rawName != "" {
-			eventName = rawName
+	title := metadata.Title
+	if title == "" {
+		title = strings.TrimPrefix(requestURL, "/")
+		if title == "" {
+			title = hostname
 		}
+	}
+
+	referrer := metadata.Referrer
+	visitorIP := metadata.IP
+	visitorUserAgent := metadata.UserAgent
+	if visitorUserAgent == "" {
+		visitorUserAgent = r.UserAgent()
+	}
+	if visitorUserAgent == "" {
+		visitorUserAgent = "Short-Umami-Sync/1.0"
 	}
 
 	umamiPayload := map[string]any{
 		"website":  propertyID,
 		"url":      requestURL,
 		"hostname": hostname,
-		"name":     eventName,
+		"referrer": referrer,
+		"title":    title,
+		"name":     "pageview",
+		"data": map[string]any{
+			"source":          "shortio",
+			"property_source": resolvedFrom,
+			"ip":              visitorIP,
+			"user_agent":      visitorUserAgent,
+		}
 	}
 	if domain != "" {
 		umamiPayload["domain"] = domain
 	}
-	if resolvedFrom != "" {
-		umamiPayload["data"] = map[string]any{
-			"source":          "shortio",
-			"property_source": resolvedFrom,
-		}
+	if visitorIP == "" {
+		delete(umamiPayload["data"].(map[string]any), "ip")
+	}
+	if visitorUserAgent == "" {
+		delete(umamiPayload["data"].(map[string]any), "user_agent")
+	}
+	if referrer == "" {
+		delete(umamiPayload, "referrer")
+	}
+	if title == "" {
+		delete(umamiPayload, "title")
 	}
 
 	forward := map[string]any{
@@ -678,11 +703,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		return false, err.Error()
 	}
 	req.Header.Set("Content-Type", "application/json")
-	userAgent := strings.TrimSpace(r.UserAgent())
-	if userAgent == "" {
-		userAgent = "Short-Umami-Sync/1.0"
-	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", visitorUserAgent)
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -698,42 +719,32 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	return true, ""
 }
 
-func extractStringField(value any, keys ...string) string {
-	switch v := value.(type) {
-	case map[string]any:
-		for _, key := range keys {
-			if raw, ok := v[key]; ok {
-				if s := stringFromAny(raw); s != "" {
-					return s
-				}
-			}
-		}
-		for _, raw := range v {
-			if s := extractStringField(raw, keys...); s != "" {
-				return s
-			}
-		}
-	case []any:
-		for _, item := range v {
-			if s := extractStringField(item, keys...); s != "" {
-				return s
-			}
-		}
-	case string:
-		return strings.TrimSpace(v)
+func extractShortioMetadata(value any) struct {
+	Hostname   string
+	Path       string
+	Referrer   string
+	UserAgent  string
+	IP         string
+	Title      string
+} {
+	var meta struct {
+		Hostname  string
+		Path      string
+		Referrer  string
+		UserAgent string
+		IP        string
+		Title     string
 	}
-	return ""
-}
-
-func stringFromAny(value any) string {
-	switch v := value.(type) {
-	case string:
-		return strings.TrimSpace(v)
-	case fmt.Stringer:
-		return strings.TrimSpace(v.String())
-	default:
-		return ""
+	if value == nil {
+		return meta
 	}
+	meta.Hostname = extractStringField(value, "origin", "shortDomain", "short_domain", "shortUrlDomain", "short_url_domain", "hostname", "domain")
+	meta.Path = extractStringField(value, "path", "slug", "url", "uri")
+	meta.Referrer = extractStringField(value, "referrer", "referer")
+	meta.UserAgent = extractStringField(value, "user-agent", "user_agent", "userAgent", "agent")
+	meta.IP = extractStringField(value, "ip", "host", "visitor_ip", "visitorIp", "remote_addr", "remote")
+	meta.Title = extractStringField(value, "title")
+	return meta
 }
 
 func (a *app) listMappings(ctx context.Context) ([]Mapping, error) {
