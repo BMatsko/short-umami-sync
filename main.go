@@ -663,6 +663,8 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		language = strings.TrimSpace(r.Header.Get("Accept-Language"))
 	}
 
+	screen := extractStringField(decoded, "screen", "screen_resolution", "screenResolution")
+
 	referrer := meta.Referrer
 	visitorIP := meta.IP
 	visitorUserAgent := meta.UserAgent
@@ -674,14 +676,14 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	}
 
 	umamiPayload := map[string]any{
-		"website":  propertyID,
-		"url":      requestURL,
 		"hostname": hostname,
+		"language": language,
 		"referrer": referrer,
+		"screen":   screen,
 		"title":    title,
-	}
-	if language != "" {
-		umamiPayload["language"] = language
+		"url":      requestURL,
+		"website":  propertyID,
+		"name":     title,
 	}
 
 	forward := map[string]any{
@@ -704,9 +706,6 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	}
 	if referrer != "" {
 		req.Header.Set("Referer", referrer)
-	}
-	if language != "" {
-		req.Header.Set("Accept-Language", language)
 	}
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
