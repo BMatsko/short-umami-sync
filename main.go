@@ -45,6 +45,7 @@ type app struct {
 	sessionSecret    string
 	settingsMu       sync.RWMutex
 	mappingsMu       sync.RWMutex
+	mappings         []Mapping
 	umamiEndpoint    string
 	umamiAPIKey      string
 	umamiDefaultProp string
