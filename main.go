@@ -71,6 +71,7 @@ func main() {
 	mux.HandleFunc("/dashboard/mappings", cfg.requireAuth(cfg.mappingUpsertHandler))
 	mux.HandleFunc("/dashboard/mappings/delete", cfg.requireAuth(cfg.mappingDeleteHandler))
 	mux.HandleFunc("/webhooks/shortio", cfg.shortioWebhookHandler)
+	mux.HandleFunc("/webhooks/shortio/", cfg.shortioWebhookHandler)
 	mux.HandleFunc("/", cfg.rootHandler)
 
 	addr := ":" + envOr("PORT", "8080")
