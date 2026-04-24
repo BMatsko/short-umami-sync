@@ -658,6 +658,11 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		}
 	}
 
+	language := extractStringField(decoded, "language", "accept-language", "accept_language")
+	if language == "" {
+		language = strings.TrimSpace(r.Header.Get("Accept-Language"))
+	}
+
 	referrer := meta.Referrer
 	visitorIP := meta.IP
 	visitorUserAgent := meta.UserAgent
@@ -668,34 +673,19 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		visitorUserAgent = "Short-Umami-Sync/1.0"
 	}
 
-	umamiData := map[string]any{
-		"source":          "shortio",
-		"property_source": resolvedFrom,
-	}
-	if visitorIP != "" {
-		umamiData["ip"] = visitorIP
-	}
-	if visitorUserAgent != "" {
-		umamiData["user_agent"] = visitorUserAgent
-	}
-	if domain != "" {
-		umamiData["domain"] = domain
-	}
-
 	umamiPayload := map[string]any{
 		"website":  propertyID,
 		"url":      requestURL,
 		"hostname": hostname,
+		"referrer": referrer,
 		"title":    title,
-		"name":     "pageview",
-		"data":     umamiData,
 	}
-	if referrer != "" {
-		umamiPayload["referrer"] = referrer
+	if language != "" {
+		umamiPayload["language"] = language
 	}
 
 	forward := map[string]any{
-		"type":    "event",
+		"type":    "pageview",
 		"payload": umamiPayload,
 	}
 	b, err := json.Marshal(forward)
@@ -709,6 +699,15 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", visitorUserAgent)
+	if visitorIP != "" {
+		req.Header.Set("X-Forwarded-For", visitorIP)
+	}
+	if referrer != "" {
+		req.Header.Set("Referer", referrer)
+	}
+	if language != "" {
+		req.Header.Set("Accept-Language", language)
+	}
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
