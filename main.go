@@ -106,7 +106,7 @@ func mustNewApp() *app {
 		log.Fatal(err)
 	}
 
-storedSettings, err := loadSettings(ctx, db)
+	storedSettings, err := loadSettings(ctx, db)
 	if err != nil {
 		log.Fatal(err)
 	}
