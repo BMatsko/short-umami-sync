@@ -402,6 +402,50 @@ func (a *app) saveSettings(ctx context.Context, endpoint, apiKey, defaultPropert
 	return err
 }
 
+func (a *app) listEvents(ctx context.Context, limit int) ([]Event, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := a.db.QueryContext(queryCtx, `
+		SELECT received_at, source, domain, property_id, payload, forwarded, forward_error
+		FROM event_history
+		ORDER BY received_at DESC, id DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var event Event
+		var domain, propertyID, forwardError string
+		var payload []byte
+		if err := rows.Scan(&event.ReceivedAt, &event.Source, &domain, &propertyID, &payload, &event.Forwarded, &forwardError); err != nil {
+			return nil, err
+		}
+		if domain != "" {
+			event.Domain = domain
+		}
+		if propertyID != "" {
+			event.PropertyID = propertyID
+		}
+		if forwardError != "" {
+			event.ForwardError = forwardError
+		}
+		event.Payload = json.RawMessage(payload)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+
 func initEventHistory(ctx context.Context, db *sql.DB) error {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
