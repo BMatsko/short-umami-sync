@@ -632,6 +632,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		forward["domain"] = domain
 	}
 	if propertyID != "" {
+		forward["website"] = propertyID
 		forward["website_id"] = propertyID
 		forward["property_source"] = resolvedFrom
 	}
