@@ -38,6 +38,15 @@ type Mapping struct {
 	UpdatedAt  time.Time
 }
 
+type shortioMetadata struct {
+	Hostname  string
+	Path      string
+	Referrer  string
+	UserAgent string
+	IP        string
+	Title     string
+}
+
 type app struct {
 	db               *sql.DB
 	password         string
@@ -623,9 +632,9 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		decoded = nil
 	}
 
-	metadata := extractShortioMetadata(decoded)
+	meta := extractShortioMetadata(decoded)
 
-	hostname := metadata.Hostname
+	hostname := meta.Hostname
 	if hostname == "" {
 		hostname = domain
 	}
@@ -633,7 +642,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		hostname = normalizeDomain(r.Host)
 	}
 
-	requestURL := metadata.Path
+	requestURL := meta.Path
 	if requestURL == "" {
 		requestURL = "/"
 	}
@@ -641,7 +650,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		requestURL = "/" + strings.TrimLeft(requestURL, "/")
 	}
 
-	title := metadata.Title
+	title := meta.Title
 	if title == "" {
 		title = strings.TrimPrefix(requestURL, "/")
 		if title == "" {
@@ -649,9 +658,9 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		}
 	}
 
-	referrer := metadata.Referrer
-	visitorIP := metadata.IP
-	visitorUserAgent := metadata.UserAgent
+	referrer := meta.Referrer
+	visitorIP := meta.IP
+	visitorUserAgent := meta.UserAgent
 	if visitorUserAgent == "" {
 		visitorUserAgent = r.UserAgent()
 	}
@@ -659,34 +668,30 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		visitorUserAgent = "Short-Umami-Sync/1.0"
 	}
 
+	umamiData := map[string]any{
+		"source":          "shortio",
+		"property_source": resolvedFrom,
+	}
+	if visitorIP != "" {
+		umamiData["ip"] = visitorIP
+	}
+	if visitorUserAgent != "" {
+		umamiData["user_agent"] = visitorUserAgent
+	}
+	if domain != "" {
+		umamiData["domain"] = domain
+	}
+
 	umamiPayload := map[string]any{
 		"website":  propertyID,
 		"url":      requestURL,
 		"hostname": hostname,
-		"referrer": referrer,
 		"title":    title,
 		"name":     "pageview",
-		"data": map[string]any{
-			"source":          "shortio",
-			"property_source": resolvedFrom,
-			"ip":              visitorIP,
-			"user_agent":      visitorUserAgent,
-		}
+		"data":     umamiData,
 	}
-	if domain != "" {
-		umamiPayload["domain"] = domain
-	}
-	if visitorIP == "" {
-		delete(umamiPayload["data"].(map[string]any), "ip")
-	}
-	if visitorUserAgent == "" {
-		delete(umamiPayload["data"].(map[string]any), "user_agent")
-	}
-	if referrer == "" {
-		delete(umamiPayload, "referrer")
-	}
-	if title == "" {
-		delete(umamiPayload, "title")
+	if referrer != "" {
+		umamiPayload["referrer"] = referrer
 	}
 
 	forward := map[string]any{
@@ -719,22 +724,8 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	return true, ""
 }
 
-func extractShortioMetadata(value any) struct {
-	Hostname   string
-	Path       string
-	Referrer   string
-	UserAgent  string
-	IP         string
-	Title      string
-} {
-	var meta struct {
-		Hostname  string
-		Path      string
-		Referrer  string
-		UserAgent string
-		IP        string
-		Title     string
-	}
+func extractShortioMetadata(value any) shortioMetadata {
+	var meta shortioMetadata
 	if value == nil {
 		return meta
 	}
