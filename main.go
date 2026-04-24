@@ -503,7 +503,10 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/webhooks/shortio/") {
 		routeKey = normalizeDomain(strings.TrimPrefix(r.URL.Path, "/webhooks/shortio/"))
 	}
-	payload := json.RawMessage(body)
+	payload, payloadFormat, parseErr := parseShortioWebhookPayload(body, r.Header.Get("Content-Type"))
+	if parseErr != nil {
+		log.Printf("event=shortio_payload_parse_failed path=%q content_type=%q raw_body=%q error=%q", r.URL.Path, r.Header.Get("Content-Type"), truncateForLog(body, 512), parseErr)
+	}
 	payloadDomain := extractDomain(payload)
 	propertyID, resolvedFrom, resolveErr := a.resolvePropertyID(r.Context(), routeKey, payloadDomain, settings.DefaultPropertyID)
 	domainForEvent := routeKey
@@ -511,16 +514,16 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		domainForEvent = payloadDomain
 	}
 	event := Event{ReceivedAt: time.Now().UTC(), Source: "shortio", Domain: domainForEvent, PropertyID: propertyID, Payload: payload}
-	log.Printf("event=webhook_resolved source=shortio path=%q route_key=%q payload_domain=%q resolved_from=%s property_id=%q resolve_err=%q", r.URL.Path, routeKey, payloadDomain, resolvedFrom, propertyID, errString(resolveErr))
+	log.Printf("event=webhook_resolved source=shortio format=%s path=%q route_key=%q payload_domain=%q resolved_from=%s property_id=%q resolve_err=%q", payloadFormat, r.URL.Path, routeKey, payloadDomain, resolvedFrom, propertyID, errString(resolveErr))
 	if resolveErr != nil {
 		event.Forwarded = false
 		event.ForwardError = resolveErr.Error()
 	} else {
 		event.Forwarded, event.ForwardError = a.forwardToUmami(r, payload, domainForEvent, propertyID, resolvedFrom, settings.Endpoint, settings.APIKey)
 		if event.Forwarded {
-			log.Printf("event=webhook_forwarded source=shortio path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s", r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom)
+			log.Printf("event=webhook_forwarded source=shortio format=%s path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s", payloadFormat, r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom)
 		} else {
-			log.Printf("event=webhook_forward_failed source=shortio path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s error=%q", r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom, event.ForwardError)
+			log.Printf("event=webhook_forward_failed source=shortio format=%s path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s error=%q", payloadFormat, r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom, event.ForwardError)
 		}
 	}
 	if err := persistEvent(r.Context(), a.db, event); err != nil {
@@ -528,6 +531,60 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": event.Forwarded, "error": event.ForwardError, "domain": domainForEvent, "property_id": propertyID})
+}
+func parseShortioWebhookPayload(body []byte, contentType string) (json.RawMessage, string, error) {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return nil, "", fmt.Errorf("empty payload")
+	}
+
+	var decoded any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+		normalized, err := json.Marshal(decoded)
+		if err != nil {
+			return nil, "", err
+		}
+		return json.RawMessage(normalized), "json", nil
+	} else {
+		log.Printf("event=shortio_payload_json_parse_failed content_type=%q raw_body=%q error=%q", contentType, truncateForLog(body, 512), err)
+	}
+
+	values, err := url.ParseQuery(trimmed)
+	if err == nil && len(values) > 0 {
+		normalized := make(map[string]any, len(values))
+		for key, vals := range values {
+			switch len(vals) {
+			case 0:
+				normalized[key] = ""
+			case 1:
+				normalized[key] = vals[0]
+			default:
+				normalized[key] = vals
+			}
+		}
+		marshaled, marshalErr := json.Marshal(normalized)
+		if marshalErr != nil {
+			return nil, "", marshalErr
+		}
+		return json.RawMessage(marshaled), "form", nil
+	}
+
+	raw, err := json.Marshal(map[string]any{"raw": trimmed})
+	if err != nil {
+		return nil, "", fmt.Errorf("unsupported Short.io webhook payload format: %w", err)
+	}
+	return json.RawMessage(raw), "raw", nil
+}
+
+func truncateForLog(body []byte, limit int) string {
+	value := strings.TrimSpace(string(body))
+	if len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return value[:limit]
+	}
+	return value[:limit-3] + "..."
 }
 
 func (a *app) resolvePropertyID(ctx context.Context, routeKey, payloadDomain, defaultPropertyID string) (propertyID string, resolvedFrom string, err error) {
@@ -763,7 +820,7 @@ func extractDomain(payload json.RawMessage) string {
 func extractDomainValue(value any) string {
 	switch v := value.(type) {
 	case map[string]any:
-		for _, key := range []string{"domain", "shortDomain", "short_domain", "shortUrlDomain", "short_url_domain", "shortUrl", "short_url", "hostname", "host"} {
+		for _, key := range []string{"domain", "origin", "shortDomain", "short_domain", "shortUrlDomain", "short_url_domain", "shortUrl", "short_url", "hostname", "host"} {
 			if raw, ok := v[key]; ok {
 				if domain := domainFromValue(raw); domain != "" {
 					return domain
