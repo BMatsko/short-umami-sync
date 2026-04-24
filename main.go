@@ -738,6 +738,44 @@ func extractShortioMetadata(value any) shortioMetadata {
 	return meta
 }
 
+func extractStringField(value any, keys ...string) string {
+	switch v := value.(type) {
+	case map[string]any:
+		for _, key := range keys {
+			if raw, ok := v[key]; ok {
+				if s := stringFromAny(raw); s != "" {
+					return s
+				}
+			}
+		}
+		for _, raw := range v {
+			if s := extractStringField(raw, keys...); s != "" {
+				return s
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if s := extractStringField(item, keys...); s != "" {
+				return s
+			}
+		}
+	case string:
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	default:
+		return ""
+	}
+}
+
 func (a *app) listMappings(ctx context.Context) ([]Mapping, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
