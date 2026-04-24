@@ -472,7 +472,7 @@ func persistEvent(ctx context.Context, db *sql.DB, event Event) error {
 	_, err := db.ExecContext(queryCtx, `
 		INSERT INTO event_history (received_at, source, domain, property_id, payload, forwarded, forward_error)
 		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5::jsonb, $6, $7)
-	`, event.ReceivedAt, event.Source, event.Domain, event.PropertyID, []byte(event.Payload), event.Forwarded, event.ForwardError)
+	`, event.ReceivedAt, event.Source, event.Domain, event.PropertyID, string(event.Payload), event.Forwarded, event.ForwardError)
 	return err
 }
 
