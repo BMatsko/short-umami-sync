@@ -1200,7 +1200,7 @@ const dashboardTemplate = `<!doctype html>
     }
 
     async function copyWebhook(domain, button) {
-      const url = window.location.origin.replace(//$/, "") + '/webhooks/shortio/' + encodeURIComponent(domain);
+      const url = window.location.origin.replace(/\/$/, "") + '/webhooks/shortio/' + encodeURIComponent(domain);
       try {
         await navigator.clipboard.writeText(url);
         const previous = button.textContent;
