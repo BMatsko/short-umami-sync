@@ -469,10 +469,18 @@ func initEventHistory(ctx context.Context, db *sql.DB) error {
 func persistEvent(ctx context.Context, db *sql.DB, event Event) error {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
+	payload := []byte(event.Payload)
+	if !json.Valid(payload) {
+		if quoted, err := json.Marshal(string(payload)); err == nil {
+			payload = quoted
+		} else {
+			payload = []byte("\"\"")
+		}
+	}
 	_, err := db.ExecContext(queryCtx, `
 		INSERT INTO event_history (received_at, source, domain, property_id, payload, forwarded, forward_error)
 		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5::jsonb, $6, $7)
-	`, event.ReceivedAt, event.Source, event.Domain, event.PropertyID, string(event.Payload), event.Forwarded, event.ForwardError)
+	`, event.ReceivedAt, event.Source, event.Domain, event.PropertyID, payload, event.Forwarded, event.ForwardError)
 	return err
 }
 
@@ -503,11 +511,17 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		domainForEvent = payloadDomain
 	}
 	event := Event{ReceivedAt: time.Now().UTC(), Source: "shortio", Domain: domainForEvent, PropertyID: propertyID, Payload: payload}
+	log.Printf("event=webhook_resolved source=shortio path=%q route_key=%q payload_domain=%q resolved_from=%s property_id=%q resolve_err=%q", r.URL.Path, routeKey, payloadDomain, resolvedFrom, propertyID, errString(resolveErr))
 	if resolveErr != nil {
 		event.Forwarded = false
 		event.ForwardError = resolveErr.Error()
 	} else {
 		event.Forwarded, event.ForwardError = a.forwardToUmami(r, payload, domainForEvent, propertyID, resolvedFrom, settings.Endpoint, settings.APIKey)
+		if event.Forwarded {
+			log.Printf("event=webhook_forwarded source=shortio path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s", r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom)
+		} else {
+			log.Printf("event=webhook_forward_failed source=shortio path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s error=%q", r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom, event.ForwardError)
+		}
 	}
 	if err := persistEvent(r.Context(), a.db, event); err != nil {
 		log.Printf("failed to persist event: %v", err)
@@ -710,6 +724,13 @@ func parseInt64(s string) (int64, error) {
 	var n int64
 	_, err := fmt.Sscanf(s, "%d", &n)
 	return n, err
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func normalizeDomain(raw string) string {
