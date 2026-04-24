@@ -71,6 +71,7 @@ func main() {
 	mux.HandleFunc("/dashboard/mappings", cfg.requireAuth(cfg.mappingUpsertHandler))
 	mux.HandleFunc("/dashboard/mappings/delete", cfg.requireAuth(cfg.mappingDeleteHandler))
 	mux.HandleFunc("/webhooks/shortio", cfg.shortioWebhookHandler)
+	mux.HandleFunc("/webhooks/shortio/", cfg.shortioWebhookHandler)
 	mux.HandleFunc("/", cfg.rootHandler)
 
 	addr := ":" + envOr("PORT", "8080")
@@ -490,37 +491,54 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty payload", http.StatusBadRequest)
 		return
 	}
+	routeKey := ""
+	if strings.HasPrefix(r.URL.Path, "/webhooks/shortio/") {
+		routeKey = normalizeDomain(strings.TrimPrefix(r.URL.Path, "/webhooks/shortio/"))
+	}
 	payload := json.RawMessage(body)
-	domain := extractDomain(payload)
-	propertyID, resolvedFrom, resolveErr := a.resolvePropertyID(r.Context(), domain, settings.DefaultPropertyID)
-	event := Event{ReceivedAt: time.Now().UTC(), Source: "shortio", Domain: domain, PropertyID: propertyID, Payload: payload}
+	payloadDomain := extractDomain(payload)
+	propertyID, resolvedFrom, resolveErr := a.resolvePropertyID(r.Context(), routeKey, payloadDomain, settings.DefaultPropertyID)
+	domainForEvent := routeKey
+	if domainForEvent == "" {
+		domainForEvent = payloadDomain
+	}
+	event := Event{ReceivedAt: time.Now().UTC(), Source: "shortio", Domain: domainForEvent, PropertyID: propertyID, Payload: payload}
 	if resolveErr != nil {
 		event.Forwarded = false
 		event.ForwardError = resolveErr.Error()
 	} else {
-		event.Forwarded, event.ForwardError = a.forwardToUmami(r, payload, domain, propertyID, resolvedFrom, settings.Endpoint, settings.APIKey)
+		event.Forwarded, event.ForwardError = a.forwardToUmami(r, payload, domainForEvent, propertyID, resolvedFrom, settings.Endpoint, settings.APIKey)
 	}
 	if err := persistEvent(r.Context(), a.db, event); err != nil {
 		log.Printf("failed to persist event: %v", err)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": event.Forwarded, "error": event.ForwardError, "domain": domain, "property_id": propertyID})
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": event.Forwarded, "error": event.ForwardError, "domain": domainForEvent, "property_id": propertyID})
 }
 
-func (a *app) resolvePropertyID(ctx context.Context, domain, defaultPropertyID string) (propertyID string, resolvedFrom string, err error) {
-	if domain != "" {
-		mapped, err := a.getMapping(ctx, domain)
+func (a *app) resolvePropertyID(ctx context.Context, routeKey, payloadDomain, defaultPropertyID string) (propertyID string, resolvedFrom string, err error) {
+	for _, candidate := range []struct {
+		value  string
+		source string
+	}{
+		{value: routeKey, source: "route"},
+		{value: payloadDomain, source: "payload"},
+	} {
+		if candidate.value == "" {
+			continue
+		}
+		mapped, err := a.getMapping(ctx, candidate.value)
 		if err != nil {
 			return "", "", err
 		}
 		if mapped != "" {
-			return mapped, "database", nil
+			return mapped, candidate.source, nil
 		}
 	}
 	if strings.TrimSpace(defaultPropertyID) != "" {
 		return strings.TrimSpace(defaultPropertyID), "environment", nil
 	}
-	return "", "", fmt.Errorf("no domain mapping found for %q", domain)
+	return "", "", fmt.Errorf("no domain mapping found for route key %q or payload domain %q", routeKey, payloadDomain)
 }
 
 func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, propertyID, resolvedFrom, endpoint, apiKey string) (bool, string) {
@@ -1181,7 +1199,8 @@ const dashboardTemplate = `<!doctype html>
       }
     }
 
-    async function copyWebhook(url, button) {
+    async function copyWebhook(domain, button) {
+      const url = window.location.origin.replace(//$/, "") + '/webhooks/shortio/' + encodeURIComponent(domain);
       try {
         await navigator.clipboard.writeText(url);
         const previous = button.textContent;
@@ -1274,8 +1293,8 @@ const dashboardTemplate = `<!doctype html>
                   <div>
                     <div class="mapping-title"><code>{{.Domain}}</code></div>
                     <div class="mapping-url">
-                      <span>{{printf "https://short-umami-sync-production.up.railway.app/webhooks/shortio/%s" .Domain}}</span>
-                      <button class="secondary" type="button" onclick="copyWebhook('{{printf "https://short-umami-sync-production.up.railway.app/webhooks/shortio/%s" .Domain}}', this)">Copy Webhook</button>
+                      <span>{{printf "/webhooks/shortio/%s" .Domain}}</span>
+                      <button class="secondary" type="button" onclick="copyWebhook('{{.Domain}}', this)">Copy Webhook</button>
                     </div>
                   </div>
                   <div class="row-actions">
