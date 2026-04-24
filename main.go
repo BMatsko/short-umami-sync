@@ -617,34 +617,72 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	if endpoint == "" {
 		return false, "UMAMI_ENDPOINT is not configured"
 	}
-	forward := map[string]any{
-		"source":      "shortio",
-		"received_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"request": map[string]any{
-			"method": r.Method,
-			"path":   r.URL.Path,
-			"remote":  r.RemoteAddr,
-			"agent":   r.UserAgent(),
-		},
-		"payload": json.RawMessage(payload),
+
+	var decoded any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		decoded = nil
+	}
+
+	hostname := domain
+	if hostname == "" && decoded != nil {
+		hostname = extractDomainValue(decoded)
+	}
+	if hostname == "" {
+		hostname = normalizeDomain(r.Host)
+	}
+
+	requestURL := "/"
+	if decoded != nil {
+		if rawURL := extractStringField(decoded, "url", "path", "slug", "pathname", "uri", "link"); rawURL != "" {
+			requestURL = rawURL
+		}
+	}
+	if !strings.HasPrefix(requestURL, "/") {
+		requestURL = "/" + strings.TrimLeft(requestURL, "/")
+	}
+
+	eventName := "shortio-click"
+	if decoded != nil {
+		if rawName := extractStringField(decoded, "name", "event", "event_name", "action", "type"); rawName != "" {
+			eventName = rawName
+		}
+	}
+
+	umamiPayload := map[string]any{
+		"website":  propertyID,
+		"url":      requestURL,
+		"hostname": hostname,
+		"name":     eventName,
 	}
 	if domain != "" {
-		forward["domain"] = domain
+		umamiPayload["domain"] = domain
 	}
-	if propertyID != "" {
-		forward["website"] = propertyID
-		forward["website_id"] = propertyID
-		forward["property_source"] = resolvedFrom
+	if resolvedFrom != "" {
+		umamiPayload["data"] = map[string]any{
+			"source":          "shortio",
+			"property_source": resolvedFrom,
+		}
+	}
+
+	forward := map[string]any{
+		"type":    "event",
+		"payload": umamiPayload,
 	}
 	b, err := json.Marshal(forward)
 	if err != nil {
 		return false, err.Error()
 	}
+
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(b)))
 	if err != nil {
 		return false, err.Error()
 	}
 	req.Header.Set("Content-Type", "application/json")
+	userAgent := strings.TrimSpace(r.UserAgent())
+	if userAgent == "" {
+		userAgent = "Short-Umami-Sync/1.0"
+	}
+	req.Header.Set("User-Agent", userAgent)
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -660,6 +698,43 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	return true, ""
 }
 
+func extractStringField(value any, keys ...string) string {
+	switch v := value.(type) {
+	case map[string]any:
+		for _, key := range keys {
+			if raw, ok := v[key]; ok {
+				if s := stringFromAny(raw); s != "" {
+					return s
+				}
+			}
+		}
+		for _, raw := range v {
+			if s := extractStringField(raw, keys...); s != "" {
+				return s
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if s := extractStringField(item, keys...); s != "" {
+				return s
+			}
+		}
+	case string:
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	default:
+		return ""
+	}
+}
 
 func (a *app) listMappings(ctx context.Context) ([]Mapping, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
