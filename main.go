@@ -50,10 +50,11 @@ type app struct {
 	umamiDefaultProp string
 	mu               sync.Mutex
 	events           []Event
-	mappings         []Mapping
 	tmplLogin        *template.Template
 	tmplDash         *template.Template
 }
+
+var eventsFileMu sync.Mutex
 
 func main() {
 	setupPersistentLogging()
@@ -67,6 +68,7 @@ func main() {
 	mux.HandleFunc("/login", cfg.loginHandler)
 	mux.HandleFunc("/logout", cfg.logoutHandler)
 	mux.HandleFunc("/dashboard", cfg.requireAuth(cfg.dashboardHandler))
+	mux.HandleFunc("/api/events", cfg.requireAuth(cfg.apiEventsHandler))
 	mux.HandleFunc("/dashboard/settings", cfg.requireAuth(cfg.settingsUpdateHandler))
 	mux.HandleFunc("/dashboard/mappings", cfg.requireAuth(cfg.mappingUpsertHandler))
 	mux.HandleFunc("/dashboard/mappings/delete", cfg.requireAuth(cfg.mappingDeleteHandler))
@@ -276,6 +278,7 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.refreshEventsFromDisk()
 	a.mu.Lock()
 	items := make([]Event, len(a.events))
 	copy(items, a.events)
@@ -292,6 +295,28 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		"Message":          r.URL.Query().Get("message"),
 		"Error":            r.URL.Query().Get("error"),
 	})
+}
+
+func (a *app) refreshEventsFromDisk() {
+	events, err := loadPersistedEvents()
+	if err != nil {
+		log.Printf("failed to reload persisted events: %v", err)
+		return
+	}
+	a.mu.Lock()
+	a.events = events
+	a.mu.Unlock()
+}
+
+func (a *app) apiEventsHandler(w http.ResponseWriter, r *http.Request) {
+	a.refreshEventsFromDisk()
+	a.mu.Lock()
+	items := make([]Event, len(a.events))
+	copy(items, a.events)
+	a.mu.Unlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].ReceivedAt.After(items[j].ReceivedAt) })
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(items)
 }
 
 func (a *app) mappingUpsertHandler(w http.ResponseWriter, r *http.Request) {
@@ -409,6 +434,8 @@ func (a *app) saveSettings(ctx context.Context, endpoint, apiKey, defaultPropert
 }
 
 func loadPersistedEvents() ([]Event, error) {
+	eventsFileMu.Lock()
+	defer eventsFileMu.Unlock()
 	data, err := os.ReadFile(eventsFilePath())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -427,6 +454,8 @@ func loadPersistedEvents() ([]Event, error) {
 }
 
 func persistEvents(events []Event) error {
+	eventsFileMu.Lock()
+	defer eventsFileMu.Unlock()
 	if err := os.MkdirAll("/data", 0o755); err != nil {
 		return err
 	}
@@ -996,7 +1025,7 @@ const dashboardTemplate = `<!doctype html>
       word-break: break-word;
       font-size: .92em;
     }
-    .page { width: min(1120px, calc(100% - 24px)); margin: 12px auto 28px; }
+    .page { width: min(1120px, calc(100% - 16px)); margin: 8px auto 20px; }
     .topbar {
       display: grid;
       grid-template-columns: minmax(0, 1fr);
@@ -1011,7 +1040,7 @@ const dashboardTemplate = `<!doctype html>
       backdrop-filter: blur(10px);
       box-shadow: 0 22px 60px rgba(15, 23, 42, 0.06);
     }
-    .hero { padding: 20px; }
+    .hero { padding: 16px; }
     .eyebrow {
       display: inline-flex;
       padding: 7px 10px;
@@ -1029,8 +1058,8 @@ const dashboardTemplate = `<!doctype html>
     h2 { font-size: 17px; }
     p { margin: 0; }
     .subtitle { margin-top: 10px; max-width: 72ch; color: var(--muted); line-height: 1.55; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-start; }
-    .actions > * { flex: 1 1 160px; }
+    .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .actions > * { min-width: 0; }
     .btn, button {
       display: inline-flex;
       align-items: center;
@@ -1039,6 +1068,8 @@ const dashboardTemplate = `<!doctype html>
       padding: 0 14px;
       width: 100%;
       border-radius: 12px;
+      white-space: normal;
+      text-align: center;
       border: 1px solid rgba(148, 163, 184, 0.28);
       background: var(--surface-2);
       color: var(--text);
@@ -1079,16 +1110,20 @@ const dashboardTemplate = `<!doctype html>
       gap: 12px;
       margin-top: 12px;
     }
-    .card { padding: 16px; }
+    .card { padding: 14px; }
     .settings, .mappings, .events { grid-column: span 1; }
     @media (min-width: 720px) {
+      .page { width: min(1120px, calc(100% - 24px)); margin: 12px auto 28px; }
+      .hero { padding: 20px; }
+      .card { padding: 16px; }
+      .actions { grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .mapping-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .toolbar { flex-direction: row; justify-content: space-between; align-items: center; }
       .mapping-top { flex-direction: row; justify-content: space-between; align-items: flex-start; }
       .mapping-url { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
       .mapping-url button { width: auto; }
       .event-head { flex-direction: row; justify-content: space-between; align-items: flex-start; }
-      .row-actions { align-items: center; }
+      .row-actions { grid-template-columns: repeat(3, auto); justify-content: end; }
       .row-actions .chip { width: auto; }
     }
     .section-head {
@@ -1142,8 +1177,9 @@ const dashboardTemplate = `<!doctype html>
       color: var(--muted);
       font-size: 13px;
     }
+    .mapping-url span { word-break: break-word; }
     .mapping-url button { width: 100%; }
-    .row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: stretch; }
+    .row-actions { display: grid; gap: 8px; }
     .row-actions .chip { width: 100%; }
     .secondary {
       background: transparent;
@@ -1180,6 +1216,60 @@ const dashboardTemplate = `<!doctype html>
     }
   </style>
   <script>
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function formatDate(value) {
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return escapeHtml(value);
+      return new Intl.DateTimeFormat([], { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+    }
+
+    function renderEvent(event) {
+      const domain = event.domain || '—';
+      const propertyID = event.property_id || '—';
+      const forwarded = event.forwarded ? 'true' : 'false';
+      const error = event.forward_error ? '<div class="notice error" style="margin-top:12px;">' + escapeHtml(event.forward_error) + '</div>' : '';
+      return '' +
+        '<div class="event">' +
+          '<div class="event-head">' +
+            '<div>' +
+              '<div class="badge">' + escapeHtml(event.source || '') + '</div>' +
+              '<div style="margin-top: 8px; font-weight: 700;">' + formatDate(event.received_at) + '</div>' +
+            '</div>' +
+            '<div class="row-actions">' +
+              '<span class="chip"><strong>Domain</strong> ' + escapeHtml(domain) + '</span>' +
+              '<span class="chip"><strong>Site</strong> ' + escapeHtml(propertyID) + '</span>' +
+              '<span class="chip"><strong>Forwarded</strong> ' + forwarded + '</span>' +
+            '</div>' +
+          '</div>' +
+          error +
+          '<pre>' + escapeHtml(JSON.stringify(event.payload ?? null, null, 2)) + '</pre>' +
+        '</div>';
+    }
+
+    async function refreshEvents() {
+      const container = document.getElementById('events-list');
+      if (!container) return;
+      try {
+        const response = await fetch('/api/events', { cache: 'no-store' });
+        if (!response.ok) return;
+        const events = await response.json();
+        if (!Array.isArray(events) || events.length === 0) {
+          container.innerHTML = '<p class="muted tiny">No events received yet.</p>';
+          return;
+        }
+        container.innerHTML = events.map(renderEvent).join('');
+      } catch (error) {
+      }
+    }
+
     async function copyWebhook(url, button) {
       try {
         await navigator.clipboard.writeText(url);
@@ -1191,6 +1281,8 @@ const dashboardTemplate = `<!doctype html>
         setTimeout(() => { button.textContent = 'Copy Webhook'; }, 1200);
       }
     }
+
+    window.addEventListener('DOMContentLoaded', refreshEvents);
   </script>
 </head>
 <body>
@@ -1295,7 +1387,7 @@ const dashboardTemplate = `<!doctype html>
             <p class="muted tiny">Recent webhook activity.</p>
           </div>
         </div>
-        <div class="events-list">
+        <div class="events-list" id="events-list">
           {{if .Events}}
             {{range .Events}}
               <div class="event">
