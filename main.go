@@ -697,7 +697,6 @@ func persistMappings(mappings []Mapping) error {
 }
 
 func mappingsFilePath() string { return "/data/mappings.json" }
-
 const sessionCookieName = "short_umami_session"
 
 func (a *app) sessionCookie() *http.Cookie {
@@ -997,13 +996,13 @@ const dashboardTemplate = `<!doctype html>
       word-break: break-word;
       font-size: .92em;
     }
-    .page { width: min(1120px, calc(100% - 28px)); margin: 22px auto 36px; }
+    .page { width: min(1120px, calc(100% - 24px)); margin: 12px auto 28px; }
     .topbar {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 16px;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
       align-items: start;
-      margin-bottom: 16px;
+      margin-bottom: 12px;
     }
     .hero, .card {
       background: var(--surface);
@@ -1012,7 +1011,7 @@ const dashboardTemplate = `<!doctype html>
       backdrop-filter: blur(10px);
       box-shadow: 0 22px 60px rgba(15, 23, 42, 0.06);
     }
-    .hero { padding: 24px 24px 20px; }
+    .hero { padding: 20px; }
     .eyebrow {
       display: inline-flex;
       padding: 7px 10px;
@@ -1030,13 +1029,15 @@ const dashboardTemplate = `<!doctype html>
     h2 { font-size: 17px; }
     p { margin: 0; }
     .subtitle { margin-top: 10px; max-width: 72ch; color: var(--muted); line-height: 1.55; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-start; }
+    .actions > * { flex: 1 1 160px; }
     .btn, button {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      min-height: 40px;
+      min-height: 44px;
       padding: 0 14px;
+      width: 100%;
       border-radius: 12px;
       border: 1px solid rgba(148, 163, 184, 0.28);
       background: var(--surface-2);
@@ -1074,15 +1075,21 @@ const dashboardTemplate = `<!doctype html>
     .chip strong { color: var(--text); }
     .grid {
       display: grid;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
-      gap: 16px;
-      margin-top: 16px;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+      margin-top: 12px;
     }
-    .card { padding: 20px; }
-    .settings, .mappings, .events { grid-column: span 12; }
-    @media (min-width: 1040px) {
-      .settings { grid-column: span 4; }
-      .mappings { grid-column: span 8; }
+    .card { padding: 16px; }
+    .settings, .mappings, .events { grid-column: span 1; }
+    @media (min-width: 720px) {
+      .mapping-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolbar { flex-direction: row; justify-content: space-between; align-items: center; }
+      .mapping-top { flex-direction: row; justify-content: space-between; align-items: flex-start; }
+      .mapping-url { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+      .mapping-url button { width: auto; }
+      .event-head { flex-direction: row; justify-content: space-between; align-items: flex-start; }
+      .row-actions { align-items: center; }
+      .row-actions .chip { width: auto; }
     }
     .section-head {
       display: flex;
@@ -1094,6 +1101,7 @@ const dashboardTemplate = `<!doctype html>
     .muted { color: var(--muted); }
     .tiny { font-size: 12px; }
     .form { display: grid; gap: 12px; }
+    .mapping-fields { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }
     label {
       display: grid;
       gap: 7px;
@@ -1112,7 +1120,7 @@ const dashboardTemplate = `<!doctype html>
       outline: none;
     }
     input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
-    .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+    .toolbar { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-top: 14px; }
     .mapping {
       display: grid;
       gap: 14px;
@@ -1122,21 +1130,21 @@ const dashboardTemplate = `<!doctype html>
     .mapping:first-child { border-top: 0; padding-top: 0; }
     .mapping-top {
       display: flex;
-      justify-content: space-between;
-      gap: 14px;
-      align-items: flex-start;
-      flex-wrap: wrap;
+      flex-direction: column;
+      gap: 12px;
+      align-items: stretch;
     }
     .mapping-title { font-weight: 700; }
     .mapping-url {
-      display: flex;
+      display: grid;
       gap: 8px;
-      flex-wrap: wrap;
-      align-items: center;
+      align-items: start;
       color: var(--muted);
       font-size: 13px;
     }
-    .row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .mapping-url button { width: 100%; }
+    .row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: stretch; }
+    .row-actions .chip { width: 100%; }
     .secondary {
       background: transparent;
       border-color: rgba(148, 163, 184, 0.28);
@@ -1148,7 +1156,7 @@ const dashboardTemplate = `<!doctype html>
       border-top: 1px solid rgba(148, 163, 184, 0.14);
     }
     .event:first-child { border-top: 0; padding-top: 0; }
-    .event-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .event-head { display: flex; flex-direction: column; justify-content: space-between; gap: 12px; }
     .badge {
       display: inline-flex;
       padding: 7px 10px;
@@ -1160,7 +1168,7 @@ const dashboardTemplate = `<!doctype html>
     }
     pre {
       margin: 12px 0 0;
-      padding: 14px;
+      padding: 12px;
       border-radius: 16px;
       background: #0b1120;
       color: #d9e2f2;
@@ -1241,7 +1249,7 @@ const dashboardTemplate = `<!doctype html>
           </div>
         </div>
         <form class="form" method="post" action="/dashboard/mappings">
-          <div style="display:grid; gap:12px; grid-template-columns: repeat(2, minmax(0, 1fr));">
+          <div class="mapping-fields">
             <label>Short.io domain
               <input type="text" name="domain" placeholder="example.short.gy">
             </label>
