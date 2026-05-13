@@ -2,7 +2,10 @@ module short-umami-sync
 
 go 1.22
 
-require github.com/jackc/pgx/v5 v5.7.4
+require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
+	github.com/jackc/pgx/v5 v5.7.4
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
