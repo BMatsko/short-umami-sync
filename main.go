@@ -62,7 +62,6 @@ type app struct {
 	tmplDash         *template.Template
 }
 
-
 func main() {
 	setupPersistentLogging()
 	cfg := mustNewApp()
@@ -116,7 +115,7 @@ func mustNewApp() *app {
 		log.Fatal(err)
 	}
 
-storedSettings, err := loadSettings(ctx, db)
+	storedSettings, err := loadSettings(ctx, db)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -455,7 +454,6 @@ func (a *app) listEvents(ctx context.Context, limit int) ([]Event, error) {
 	return events, nil
 }
 
-
 func initEventHistory(ctx context.Context, db *sql.DB) error {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -488,7 +486,7 @@ func persistEvent(ctx context.Context, db *sql.DB, event Event) error {
 	}
 	_, err := db.ExecContext(queryCtx, `
 		INSERT INTO event_history (received_at, source, domain, property_id, payload, forwarded, forward_error)
-		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5::jsonb, $6, $7)
+		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
 	`, event.ReceivedAt, event.Source, event.Domain, event.PropertyID, payload, event.Forwarded, event.ForwardError)
 	return err
 }
@@ -710,7 +708,8 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return false, err.Error()
 	}
