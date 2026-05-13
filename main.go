@@ -661,7 +661,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		language = strings.TrimSpace(r.Header.Get("Accept-Language"))
 	}
 
-	screen := extractStringField(decoded, "screen", "screen_resolution", "screenResolution")
+	screen := normalizeUmamiScreen(extractStringField(decoded, "screen", "screen_resolution", "screenResolution"))
 
 	referrer := meta.Referrer
 	visitorIP := meta.IP
@@ -675,17 +675,17 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 
 	umamiPayload := map[string]any{
 		"hostname": hostname,
-		"language": language,
-		"referrer": referrer,
-		"screen":   screen,
 		"title":    title,
 		"url":      requestURL,
 		"website":  propertyID,
-		"name":     title,
+		"name":     "shortio-click",
 	}
+	setIfNotEmpty(umamiPayload, "language", language)
+	setIfNotEmpty(umamiPayload, "referrer", referrer)
+	setIfNotEmpty(umamiPayload, "screen", screen)
 
 	forward := map[string]any{
-		"type":    "pageview",
+		"type":    "event",
 		"payload": umamiPayload,
 	}
 	b, err := json.Marshal(forward)
@@ -739,7 +739,7 @@ func extractStringField(value any, keys ...string) string {
 	switch v := value.(type) {
 	case map[string]any:
 		for _, key := range keys {
-			if raw, ok := v[key]; ok {
+			if raw, ok := lookupAnyKey(v, key); ok {
 				if s := stringFromAny(raw); s != "" {
 					return s
 				}
@@ -760,6 +760,51 @@ func extractStringField(value any, keys ...string) string {
 		return strings.TrimSpace(v)
 	}
 	return ""
+}
+
+func lookupAnyKey(values map[string]any, key string) (any, bool) {
+	if raw, ok := values[key]; ok {
+		return raw, true
+	}
+	normalizedKey := normalizePayloadKey(key)
+	for candidate, raw := range values {
+		if normalizePayloadKey(candidate) == normalizedKey {
+			return raw, true
+		}
+	}
+	return nil, false
+}
+
+func normalizePayloadKey(key string) string {
+	return strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(key)))
+}
+
+func normalizeUmamiScreen(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || len(value) > 11 {
+		return ""
+	}
+	parts := strings.Split(value, "x")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	for _, part := range parts {
+		if len(part) > 5 {
+			return ""
+		}
+		for _, ch := range part {
+			if ch < '0' || ch > '9' {
+				return ""
+			}
+		}
+	}
+	return value
+}
+
+func setIfNotEmpty(values map[string]any, key, value string) {
+	if value != "" {
+		values[key] = value
+	}
 }
 
 func stringFromAny(value any) string {
@@ -934,7 +979,7 @@ func extractDomainValue(value any) string {
 	switch v := value.(type) {
 	case map[string]any:
 		for _, key := range []string{"domain", "origin", "shortDomain", "short_domain", "shortUrlDomain", "short_url_domain", "shortUrl", "short_url", "hostname", "host"} {
-			if raw, ok := v[key]; ok {
+			if raw, ok := lookupAnyKey(v, key); ok {
 				if domain := domainFromValue(raw); domain != "" {
 					return domain
 				}
