@@ -285,6 +285,16 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	forwarded := 0
+	errored := 0
+	for _, e := range events {
+		if e.Forwarded {
+			forwarded++
+		} else {
+			errored++
+		}
+	}
+
 	settings := a.settingsSnapshot()
 	_ = a.tmplDash.Execute(w, map[string]any{
 		"Events":            events,
@@ -292,6 +302,9 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		"UmamiEndpoint":     settings.Endpoint,
 		"UmamiAPIKey":       settings.APIKey,
 		"DefaultPropertyID": settings.DefaultPropertyID,
+		"Forwarded":         forwarded,
+		"Errors":            errored,
+		"TotalEvents":       len(events),
 		"Message":           r.URL.Query().Get("message"),
 		"Error":             r.URL.Query().Get("error"),
 	})
@@ -1148,99 +1161,97 @@ const loginTemplate = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Short Umami Sync</title>
+  <title>Sign in · short-umami-sync</title>
+  <link rel="preconnect" href="https://storage.braydenmatsko.com" crossorigin>
   <style>
+    @font-face { font-family: 'Terminal Land Mono'; src: url('https://storage.braydenmatsko.com/Assets/font/TerminalLandMono-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+    @font-face { font-family: 'Terminal Land Mono'; src: url('https://storage.braydenmatsko.com/Assets/font/TerminalLandMono-Bold.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+    @font-face { font-family: 'Numans'; src: url('https://storage.braydenmatsko.com/Assets/font/Numans-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+    @font-face { font-family: 'Numans'; src: url('https://storage.braydenmatsko.com/Assets/font/Numans-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
     :root {
-      color-scheme: light;
-      --bg: #f5f7fa;
-      --surface: rgba(255, 255, 255, 0.92);
-      --border: rgba(15, 23, 42, 0.08);
-      --text: #0f172a;
-      --muted: #64748b;
-      --accent-2: #115e59;
+      --blue: #5954f9; --green: #46ca8d; --red: #fd0044;
+      --ink: #0a1e2a; --bg: #f6f7f9; --surface: #ffffff;
+      --border: #ebedf1; --border-strong: #dde0e6;
+      --muted: #71808a;
+      --font-heading: 'Terminal Land Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --font-sans: 'Numans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
     }
     * { box-sizing: border-box; }
+    html, body { margin: 0; }
     body {
-      margin: 0;
       min-height: 100vh;
+      font-family: var(--font-sans);
+      color: var(--ink);
+      background: var(--bg);
       display: grid;
       place-items: center;
-      padding: 24px;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(circle at top left, rgba(45, 212, 191, 0.12), transparent 24%),
-        linear-gradient(180deg, #f8fafc 0%, #edf2f7 100%);
+      padding: 56px 24px;
+      position: relative;
     }
-    .panel {
-      width: min(100%, 420px);
-      padding: 28px;
-      border-radius: 24px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      backdrop-filter: blur(10px);
-      box-shadow: 0 24px 70px rgba(15, 23, 42, 0.08);
-    }
-    .eyebrow {
-      display: inline-flex;
-      padding: 7px 10px;
-      border-radius: 999px;
-      font-size: 11px;
-      letter-spacing: .08em;
-      text-transform: uppercase;
-      font-weight: 700;
-      color: var(--accent-2);
-      background: rgba(15, 118, 110, 0.08);
-      margin-bottom: 14px;
-    }
-    h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -0.03em; }
-    p { margin: 0; color: var(--muted); line-height: 1.55; }
-    form { margin-top: 24px; display: grid; gap: 12px; }
-    label { display: grid; gap: 8px; font-size: 13px; font-weight: 600; color: #334155; }
-    input {
-      width: 100%;
-      padding: 13px 14px;
-      border-radius: 14px;
-      border: 1px solid rgba(148, 163, 184, 0.35);
-      background: white;
-      font: inherit;
-      color: var(--text);
-      outline: none;
-    }
-    input:focus { border-color: rgba(15, 118, 110, 0.5); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
-    button {
-      border: 0;
-      border-radius: 14px;
-      padding: 12px 16px;
-      background: linear-gradient(180deg, #14b8a6, #0f766e);
-      color: white;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    .error {
-      margin-top: 14px;
-      padding: 12px 14px;
-      border-radius: 14px;
-      background: rgba(185, 28, 28, 0.08);
-      color: #b91c1c;
-      font-size: 14px;
-    }
+    .brand { position: absolute; top: 28px; left: 32px; display: flex; align-items: center; gap: 12px; }
+    .brand-mark { width: 28px; height: 34px; flex-shrink: 0; }
+    .brand-block { display: grid; gap: 3px; }
+    .kicker { margin: 0; color: var(--muted); font-family: var(--font-heading); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; }
+    .brand-title { margin: 0; color: var(--ink); font-family: var(--font-heading); font-size: 18px; letter-spacing: -0.01em; font-weight: 700; }
+    .status { position: absolute; top: 32px; right: 32px; display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: 12px; font-family: var(--font-heading); }
+    .status-dot { width: 6px; height: 6px; border-radius: 999px; background: var(--green); box-shadow: 0 0 0 3px rgba(70, 202, 141, 0.18); display: inline-block; }
+    .card { width: min(100%, 400px); display: grid; gap: 22px; }
+    .title { margin: 0; color: var(--ink); font-family: var(--font-heading); font-size: 30px; line-height: 1.1; letter-spacing: -0.02em; font-weight: 700; }
+    .subtle { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
+    .field { display: grid; gap: 7px; }
+    .field label { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; font-family: var(--font-heading); }
+    .input { width: 100%; min-height: 40px; padding: 9px 13px; border-radius: 10px; border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink); font: inherit; font-size: 13.5px; outline: none; transition: border-color .15s, box-shadow .15s; }
+    .input:focus { border-color: var(--ink); box-shadow: 0 0 0 3px rgba(10, 30, 42, 0.08); }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--ink); background: var(--ink); color: #fff; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; width: 100%; transition: background .15s, border-color .15s; }
+    .btn:hover { background: #1a2f3c; border-color: #1a2f3c; }
+    .tiny { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 0; }
+    .mono { font-family: var(--font-heading); }
+    .code { font-family: var(--font-heading); font-size: 11.5px; padding: .15rem .4rem; border-radius: 5px; background: rgba(10, 30, 42, 0.05); color: var(--ink); font-weight: 600; }
+    .notice { padding: 10px 12px; border-radius: 10px; font-size: 12.5px; font-weight: 500; display: flex; align-items: center; gap: 10px; border: 1px solid #f7dbe2; background: #fff5f7; color: #b3003a; }
+    .notice .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+    .footer { position: absolute; bottom: 28px; left: 0; right: 0; text-align: center; display: flex; justify-content: center; gap: 12px; padding: 0 24px; }
   </style>
 </head>
 <body>
-  <main class="panel">
-    <div class="eyebrow">Short Umami Sync</div>
-    <h1>Sign in</h1>
-    <p>Manage the settings, mappings, and activity feed.</p>
-    {{if .Error}}<div class="error">{{.Error}}</div>{{end}}
-    <form method="post" action="/login">
-      <label>Password
-        <input type="password" name="password" autofocus>
-      </label>
-      <button type="submit">Continue</button>
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 90 110" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect width="90" height="110" rx="20" fill="#f7f8fa"/>
+      <path fill-rule="evenodd" clip-rule="evenodd" d="M10 6C10 8.20914 11.7909 10 14 10H48.3438C49.4044 10.0002 50.4219 10.4219 51.1719 11.1719L68.8281 28.8281C69.5781 29.5781 69.9998 30.5956 70 31.6562V46C70 48.2091 71.7909 50 74 50H86C88.2091 50 90 51.7909 90 54V90C90 101.046 81.0457 110 70 110H14C11.7909 110 10 108.209 10 106V94C10 91.7909 8.20914 90 6 90H4C1.79086 90 1.12747e-07 88.2091 0 86V34C0 31.7909 1.79086 30 4 30H6C8.20914 30 10 28.2091 10 26V14C10 11.7909 8.20914 10 6 10H5C2.23858 10 0 7.76142 0 5C0 2.23858 2.23858 0 5 0C7.76142 0 10 2.23858 10 5V6ZM14 30C11.7909 30 10 31.7909 10 34V86C10 88.2091 11.7909 90 14 90H66C68.2091 90 70 88.2091 70 86V54C70 51.7909 68.2091 50 66 50H54C51.7909 50 50 48.2091 50 46V34C50 31.7909 48.2091 30 46 30H14Z" fill="url(#brand-gradient)"/>
+      <defs>
+        <linearGradient id="brand-gradient" x1="0" y1="0" x2="100" y2="146" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#0E1AFD"/>
+          <stop offset="1" stop-color="#E4BFF1"/>
+        </linearGradient>
+      </defs>
+    </svg>
+    <div class="brand-block">
+      <p class="kicker">ADMIN</p>
+      <h1 class="brand-title">Short Umami Sync</h1>
+    </div>
+  </div>
+  <div class="status">
+    <span class="status-dot"></span>
+    <span class="mono">sync</span>
+  </div>
+  <main class="card">
+    <div>
+      <p class="kicker" style="margin-bottom: 14px;">Sign in</p>
+      <h1 class="title">Welcome back.</h1>
+    </div>
+    <p class="subtle">Manage Short.io → Umami forwarding, domain mappings, and the live event feed.</p>
+    {{if .Error}}<div class="notice"><span class="dot"></span><span>{{.Error}}</span></div>{{end}}
+    <form method="post" action="/login" style="display: grid; gap: 22px;">
+      <div class="field">
+        <label for="pw">Dashboard password</label>
+        <input id="pw" class="input" name="password" type="password" autofocus>
+      </div>
+      <button class="btn" type="submit">Continue</button>
     </form>
+    <p class="tiny">Set via <code class="code">APP_PASSWORD</code>. Session lasts 7 days.</p>
   </main>
+  <div class="footer">
+    <span class="tiny">A small Go service for Short.io webhooks → Umami events.</span>
+  </div>
 </body>
 </html>`
 
@@ -1249,229 +1260,123 @@ const dashboardTemplate = `<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Dashboard - Short Umami Sync</title>
+  <title>Dashboard · short-umami-sync</title>
+  <link rel="preconnect" href="https://storage.braydenmatsko.com" crossorigin>
   <style>
+    @font-face { font-family: 'Terminal Land Mono'; src: url('https://storage.braydenmatsko.com/Assets/font/TerminalLandMono-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+    @font-face { font-family: 'Terminal Land Mono'; src: url('https://storage.braydenmatsko.com/Assets/font/TerminalLandMono-Bold.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+    @font-face { font-family: 'Numans'; src: url('https://storage.braydenmatsko.com/Assets/font/Numans-Regular.ttf') format('truetype'); font-weight: 400; font-style: normal; font-display: swap; }
+    @font-face { font-family: 'Numans'; src: url('https://storage.braydenmatsko.com/Assets/font/Numans-Bold.ttf') format('truetype'); font-weight: 700; font-style: normal; font-display: swap; }
+
     :root {
-      color-scheme: light;
-      --bg: #f5f7fa;
-      --surface: rgba(255, 255, 255, 0.9);
-      --surface-2: #ffffff;
-      --border: rgba(15, 23, 42, 0.08);
-      --text: #0f172a;
-      --muted: #64748b;
-      --accent-2: #115e59;
-      --danger: #b91c1c;
+      --blue: #5954f9; --green: #46ca8d; --red: #fd0044;
+      --ink: #0a1e2a; --bg: #f6f7f9; --surface: #ffffff;
+      --border: #ebedf1; --border-strong: #dde0e6;
+      --muted: #71808a;
+      --radius-md: 14px; --radius-lg: 18px;
+      --font-heading: 'Terminal Land Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+      --font-sans: 'Numans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
     }
     * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(circle at top left, rgba(45, 212, 191, 0.12), transparent 24%),
-        linear-gradient(180deg, #f8fafc 0%, #edf2f7 100%);
-    }
+    html, body { margin: 0; }
+    body { font-family: var(--font-sans); color: var(--ink); background: var(--bg); min-height: 100vh; }
     a { color: inherit; text-decoration: none; }
-    code {
-      padding: 0.18rem 0.45rem;
-      border-radius: 999px;
-      background: rgba(15, 23, 42, 0.05);
-      word-break: break-word;
-      font-size: .92em;
-    }
-    .page { width: min(1120px, calc(100% - 12px)); margin: 6px auto 16px; }
-    .topbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 12px;
-      align-items: start;
-      margin-bottom: 12px;
-    }
-    .hero, .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 24px;
-      backdrop-filter: blur(10px);
-      box-shadow: 0 22px 60px rgba(15, 23, 42, 0.06);
-    }
-    .hero { padding: 14px; }
-    .eyebrow {
-      display: inline-flex;
-      padding: 7px 10px;
-      border-radius: 999px;
-      font-size: 11px;
-      letter-spacing: .08em;
-      text-transform: uppercase;
-      font-weight: 700;
-      color: var(--accent-2);
-      background: rgba(15, 118, 110, 0.08);
-      margin-bottom: 14px;
-    }
-    h1, h2 { margin: 0; letter-spacing: -0.03em; }
-    h1 { font-size: 34px; line-height: 1.05; }
-    h2 { font-size: 17px; }
-    p { margin: 0; }
-    .subtitle { margin-top: 10px; max-width: 72ch; color: var(--muted); line-height: 1.55; }
-    .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .actions > * { min-width: 0; }
-    .btn, button {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 44px;
-      padding: 0 14px;
-      width: 100%;
-      border-radius: 12px;
-      white-space: normal;
-      word-break: break-word;
-      text-align: center;
-      border: 1px solid rgba(148, 163, 184, 0.28);
-      background: var(--surface-2);
-      color: var(--text);
-      font: inherit;
-      font-weight: 650;
-      cursor: pointer;
-    }
-    .btn.primary, button.primary {
-      background: linear-gradient(180deg, #14b8a6, #0f766e);
-      color: white;
-      border-color: transparent;
-    }
-    .notice {
-      margin-top: 14px;
-      padding: 12px 14px;
-      border-radius: 14px;
-      font-size: 14px;
-      line-height: 1.45;
-    }
-    .notice.success { background: rgba(21, 128, 61, 0.08); color: #15803d; }
-    .notice.error { background: rgba(185, 28, 28, 0.08); color: var(--danger); }
-    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-    .chip {
-      display: inline-flex;
-      gap: 8px;
-      align-items: center;
-      padding: 8px 10px;
-      border-radius: 999px;
-      background: rgba(15, 23, 42, 0.04);
-      color: #334155;
-      font-size: 13px;
-      border: 1px solid rgba(148, 163, 184, 0.16);
-    }
-    .chip strong { color: var(--text); }
-    .grid {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      gap: 12px;
-      margin-top: 12px;
-    }
-    .card { padding: 12px; }
-    .settings, .mappings, .events { grid-column: span 1; }
-    @media (min-width: 720px) {
-      .page { width: min(1120px, calc(100% - 24px)); margin: 10px auto 24px; }
-      .hero { padding: 18px; }
-      .card { padding: 14px; }
-      .actions { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-      .mapping-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .toolbar { flex-direction: row; justify-content: space-between; align-items: center; }
-      .mapping-top { flex-direction: row; justify-content: space-between; align-items: flex-start; }
-      .mapping-url { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
-      .mapping-url button { width: auto; }
-      .event-head { flex-direction: row; justify-content: space-between; align-items: flex-start; }
-      .row-actions { grid-template-columns: repeat(3, auto); justify-content: end; }
-      .row-actions .chip { width: auto; }
-    }
-    .section-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-    .muted { color: var(--muted); }
-    .tiny { font-size: 12px; }
-    .form { display: grid; gap: 12px; }
-    .mapping-fields { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }
-    label {
-      display: grid;
-      gap: 7px;
-      font-size: 13px;
-      font-weight: 650;
-      color: #334155;
-    }
-    input {
-      width: 100%;
-      padding: 12px 13px;
-      border-radius: 14px;
-      border: 1px solid rgba(148, 163, 184, 0.32);
-      background: white;
-      font: inherit;
-      color: var(--text);
-      outline: none;
-    }
-    input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
-    .toolbar { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-top: 14px; }
-    .mapping {
-      display: grid;
-      gap: 14px;
-      padding: 14px 0;
-      border-top: 1px solid rgba(148, 163, 184, 0.14);
-    }
-    .mapping:first-child { border-top: 0; padding-top: 0; }
-    .mapping-top {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      align-items: stretch;
-    }
-    .mapping-title { font-weight: 700; }
-    .mapping-url {
-      display: grid;
-      gap: 8px;
-      align-items: start;
-      color: var(--muted);
-      font-size: 13px;
-      word-break: break-word;
-    }
-    .mapping-url span { word-break: break-word; }
-    .mapping-url button { width: 100%; }
-    .row-actions { display: grid; gap: 8px; }
-    .row-actions .chip { width: 100%; }
-    .secondary {
-      background: transparent;
-      border-color: rgba(148, 163, 184, 0.28);
-      color: #334155;
-    }
-    .events-list { display: grid; gap: 10px; }
-    .event {
-      padding: 14px 0 0;
-      border-top: 1px solid rgba(148, 163, 184, 0.14);
-    }
-    .event:first-child { border-top: 0; padding-top: 0; }
-    .event-head { display: flex; flex-direction: column; justify-content: space-between; gap: 12px; }
-    .badge {
-      display: inline-flex;
-      padding: 7px 10px;
-      border-radius: 999px;
-      background: rgba(15, 118, 110, 0.08);
-      color: var(--accent-2);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    pre {
-      margin: 12px 0 0;
-      padding: 12px;
-      border-radius: 16px;
-      background: #0b1120;
-      color: #d9e2f2;
-      overflow: auto;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-size: 12px;
-      line-height: 1.55;
-    }
+    .shell { padding: 28px 36px 36px; max-width: 1440px; margin: 0 auto; }
+    @media (max-width: 720px) { .shell { padding: 20px 16px 32px; } }
+
+    .kicker { margin: 0; color: var(--muted); font-family: var(--font-heading); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; }
+    .eyebrow { margin: 0 0 14px; font-family: var(--font-heading); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); font-weight: 700; }
+    .title { margin: 0; color: var(--ink); font-family: var(--font-heading); font-size: 44px; line-height: 1.05; letter-spacing: -0.02em; font-weight: 700; }
+    @media (max-width: 720px) { .title { font-size: 32px; } }
+    .brand-title { margin: 0; color: var(--ink); font-family: var(--font-heading); font-size: 22px; line-height: 1.1; letter-spacing: -0.01em; font-weight: 700; }
+    .h2 { margin: 0; color: var(--ink); font-family: var(--font-heading); font-size: 14px; font-weight: 700; }
+    .subtle { margin: 0; color: var(--muted); line-height: 1.55; font-size: 14px; }
+    .tiny { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 0; }
+    .mono { font-family: var(--font-heading); }
+
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 36px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark { width: 28px; height: 34px; flex-shrink: 0; }
+    .brand-block { display: grid; gap: 3px; }
+    .topbar-right { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+    .status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+    .status-dot { width: 6px; height: 6px; border-radius: 999px; background: var(--green); box-shadow: 0 0 0 3px rgba(70, 202, 141, 0.18); display: inline-block; }
+
+    .tabs { display: inline-flex; gap: 2px; }
+    .tab { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 600; color: var(--muted); cursor: pointer; border: 0; background: transparent; font-family: inherit; text-decoration: none; transition: background .15s, color .15s; }
+    .tab:hover { color: var(--ink); }
+    .tab.active { background: var(--ink); color: #fff; }
+    .tab .count { font-family: var(--font-heading); font-size: 10.5px; padding: 1px 6px; border-radius: 999px; background: rgba(10, 30, 42, 0.08); color: var(--muted); }
+    .tab.active .count { background: rgba(255, 255, 255, 0.2); color: inherit; }
+
+    .hero { margin-bottom: 36px; display: grid; grid-template-columns: minmax(0, 1.4fr) auto; gap: 36px; align-items: end; }
+    @media (max-width: 880px) { .hero { grid-template-columns: 1fr; gap: 18px; } }
+    .stats { display: flex; gap: 28px; align-items: baseline; flex-wrap: wrap; }
+    .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; font-family: var(--font-heading); }
+    .stat-value { font-family: var(--font-heading); font-size: 28px; color: var(--ink); font-weight: 700; margin-top: 4px; }
+    .stat-value.danger { color: var(--red); }
+
+    .grid { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 24px; }
+    @media (max-width: 1024px) { .grid { grid-template-columns: 1fr; } }
+    .col { display: grid; gap: 24px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 22px; }
+    .section-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+
+    .field { display: grid; gap: 7px; }
+    .field label { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; font-family: var(--font-heading); }
+    .input { width: 100%; min-height: 40px; padding: 9px 13px; border-radius: 10px; border: 1px solid var(--border-strong); background: var(--surface); color: var(--ink); font: inherit; font-size: 13.5px; outline: none; transition: border-color .15s, box-shadow .15s; }
+    .input:focus { border-color: var(--ink); box-shadow: 0 0 0 3px rgba(10, 30, 42, 0.08); }
+    .hint { font-size: 11.5px; color: var(--muted); }
+
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 38px; padding: 0 14px; border-radius: 10px; border: 1px solid transparent; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background .15s, border-color .15s, color .15s; text-decoration: none; }
+    .btn.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
+    .btn.primary:hover { background: #1a2f3c; border-color: #1a2f3c; }
+    .btn.secondary { background: var(--surface); border-color: var(--border-strong); color: var(--ink); }
+    .btn.secondary:hover { border-color: var(--ink); }
+    .btn.ghost { background: transparent; border-color: transparent; color: var(--ink); }
+    .btn.ghost:hover { background: rgba(10, 30, 42, 0.05); }
+    .btn.danger { background: transparent; border: 1px solid var(--border-strong); color: var(--red); }
+    .btn.danger:hover { border-color: var(--red); background: rgba(253, 0, 68, 0.04); }
+
+    .notice { padding: 10px 12px; border-radius: 10px; font-size: 12.5px; font-weight: 500; display: flex; align-items: center; gap: 10px; border: 1px solid var(--border); margin-bottom: 18px; }
+    .notice.success { background: #f1faf4; color: #1a6a45; border-color: #d5ecdf; }
+    .notice.error { background: #fff5f7; color: #b3003a; border-color: #f7dbe2; }
+    .notice .dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+
+    .badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 999px; font-family: var(--font-heading); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    .badge.green { color: #1a6a45; border-color: rgba(70, 202, 141, 0.4); }
+    .badge.red { color: var(--red); border-color: rgba(253, 0, 68, 0.25); }
+    .badge.blue { color: var(--blue); border-color: rgba(89, 84, 249, 0.25); }
+    .badge .dot { width: 5px; height: 5px; border-radius: 999px; background: currentColor; }
+
+    .payload { margin: 0; padding: 14px 16px; border-radius: 12px; background: #f8f9fb; color: var(--ink); font-family: var(--font-heading); font-size: 11.5px; line-height: 1.7; overflow: auto; white-space: pre-wrap; word-break: break-word; border: 1px solid var(--border); }
+    .code { font-family: var(--font-heading); font-size: 11.5px; padding: .15rem .4rem; border-radius: 5px; background: rgba(10, 30, 42, 0.05); color: var(--ink); font-weight: 600; }
+
+    .mapping { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; padding: 18px 0; border-top: 1px solid var(--border); }
+    .mapping:first-of-type { border-top: 0; padding-top: 4px; }
+    .mapping .left { min-width: 0; }
+    .mapping .domain { font-family: var(--font-heading); font-size: 14px; color: var(--ink); font-weight: 700; }
+    .mapping .webhook { font-family: var(--font-heading); font-size: 11.5px; color: var(--muted); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .mapping .property { font-family: var(--font-heading); font-size: 11.5px; color: var(--ink); margin-top: 6px; word-break: break-all; }
+    .mapping .right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    @media (max-width: 720px) { .mapping { grid-template-columns: 1fr; } .mapping .right { justify-content: flex-start; } }
+
+    .event { padding: 14px 0; border-top: 1px solid var(--border); }
+    .event:first-of-type { border-top: 0; padding-top: 6px; }
+    .event-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+    .event-meta { display: flex; align-items: center; gap: 14px; min-width: 0; flex-wrap: wrap; }
+    .event-time { font-family: var(--font-heading); font-size: 12px; color: var(--muted); min-width: 64px; }
+    .event-domain { font-family: var(--font-heading); font-size: 13px; color: var(--ink); font-weight: 700; }
+    .event-property { font-family: var(--font-heading); font-size: 12px; color: var(--blue); word-break: break-all; }
+    .event-error { margin-top: 8px; font-size: 12px; color: var(--red); }
+    .event-payload { margin-top: 10px; }
+    details > summary { cursor: pointer; font-size: 11px; color: var(--muted); font-family: var(--font-heading); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }
+    details[open] > summary { margin-bottom: 8px; }
+
+    .add-form { display: grid; gap: 14px; padding-bottom: 22px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+    .add-form-row { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    @media (max-width: 720px) { .add-form-row { grid-template-columns: 1fr; } }
+    .end { display: flex; justify-content: flex-end; }
   </style>
   <script>
     function escapeHtml(value) {
@@ -1482,36 +1387,33 @@ const dashboardTemplate = `<!doctype html>
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#39;');
     }
-
-    function formatDate(value) {
+    function formatTime(value) {
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return escapeHtml(value);
-      return new Intl.DateTimeFormat([], { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+      return new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(date);
     }
-
     function renderEvent(event) {
       const domain = event.domain || '—';
       const propertyID = event.property_id || '—';
-      const forwarded = event.forwarded ? 'true' : 'false';
-      const error = event.forward_error ? '<div class="notice error" style="margin-top:12px;">' + escapeHtml(event.forward_error) + '</div>' : '';
+      const badge = event.forwarded
+        ? '<span class="badge green"><span class="dot"></span>forwarded</span>'
+        : '<span class="badge red"><span class="dot"></span>failed</span>';
+      const error = event.forward_error ? '<div class="event-error">' + escapeHtml(event.forward_error) + '</div>' : '';
+      const payload = '<details class="event-payload"><summary>Payload</summary><pre class="payload">' + escapeHtml(JSON.stringify(event.payload ?? null, null, 2)) + '</pre></details>';
       return '' +
         '<div class="event">' +
           '<div class="event-head">' +
-            '<div>' +
-              '<div class="badge">' + escapeHtml(event.source || '') + '</div>' +
-              '<div style="margin-top: 8px; font-weight: 700;">' + formatDate(event.received_at) + '</div>' +
+            '<div class="event-meta">' +
+              '<span class="event-time">' + formatTime(event.received_at) + '</span>' +
+              '<span class="event-domain">' + escapeHtml(domain) + '</span>' +
+              '<span class="event-property">' + escapeHtml(propertyID) + '</span>' +
             '</div>' +
-            '<div class="row-actions">' +
-              '<span class="chip"><strong>Domain</strong> ' + escapeHtml(domain) + '</span>' +
-              '<span class="chip"><strong>Site</strong> ' + escapeHtml(propertyID) + '</span>' +
-              '<span class="chip"><strong>Forwarded</strong> ' + forwarded + '</span>' +
-            '</div>' +
+            badge +
           '</div>' +
           error +
-          '<pre>' + escapeHtml(JSON.stringify(event.payload ?? null, null, 2)) + '</pre>' +
+          payload +
         '</div>';
     }
-
     async function refreshEvents() {
       const container = document.getElementById('events-list');
       if (!container) return;
@@ -1520,14 +1422,12 @@ const dashboardTemplate = `<!doctype html>
         if (!response.ok) return;
         const events = await response.json();
         if (!Array.isArray(events) || events.length === 0) {
-          container.innerHTML = '<p class="muted tiny">No events received yet.</p>';
+          container.innerHTML = '<p class="tiny">No events received yet.</p>';
           return;
         }
         container.innerHTML = events.map(renderEvent).join('');
-      } catch (error) {
-      }
+      } catch (error) {}
     }
-
     async function copyWebhook(domain, button) {
       const url = window.location.origin.replace(/\/$/, "") + '/webhooks/shortio/' + encodeURIComponent(domain);
       try {
@@ -1537,140 +1437,199 @@ const dashboardTemplate = `<!doctype html>
         setTimeout(() => { button.textContent = previous; }, 1200);
       } catch (error) {
         button.textContent = 'Copy failed';
-        setTimeout(() => { button.textContent = 'Copy Webhook'; }, 1200);
+        setTimeout(() => { button.textContent = 'Copy'; }, 1200);
       }
     }
-
     window.addEventListener('DOMContentLoaded', refreshEvents);
   </script>
 </head>
 <body>
-  <main class="page">
-    <div class="topbar">
-      <section class="hero">
-        <div class="eyebrow">Short Umami Sync</div>
-        <h1>Dashboard</h1>
-        <p class="subtitle">Minimal settings for forwarding Short.io events to Umami. Enter a full collect URL such as <code>https://stats.brayden.me/bray</code>.</p>
-        <div class="chips">
-          <span class="chip"><strong>Endpoint</strong> {{if .UmamiEndpoint}}{{.UmamiEndpoint}}{{else}}not set{{end}}</span>
-          <span class="chip"><strong>Fallback Site ID</strong> {{if .DefaultPropertyID}}{{.DefaultPropertyID}}{{else}}not set{{end}}</span>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 90 110" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <rect width="90" height="110" rx="20" fill="#f7f8fa"/>
+          <path fill-rule="evenodd" clip-rule="evenodd" d="M10 6C10 8.20914 11.7909 10 14 10H48.3438C49.4044 10.0002 50.4219 10.4219 51.1719 11.1719L68.8281 28.8281C69.5781 29.5781 69.9998 30.5956 70 31.6562V46C70 48.2091 71.7909 50 74 50H86C88.2091 50 90 51.7909 90 54V90C90 101.046 81.0457 110 70 110H14C11.7909 110 10 108.209 10 106V94C10 91.7909 8.20914 90 6 90H4C1.79086 90 1.12747e-07 88.2091 0 86V34C0 31.7909 1.79086 30 4 30H6C8.20914 30 10 28.2091 10 26V14C10 11.7909 8.20914 10 6 10H5C2.23858 10 0 7.76142 0 5C0 2.23858 2.23858 0 5 0C7.76142 0 10 2.23858 10 5V6ZM14 30C11.7909 30 10 31.7909 10 34V86C10 88.2091 11.7909 90 14 90H66C68.2091 90 70 88.2091 70 86V54C70 51.7909 68.2091 50 66 50H54C51.7909 50 50 48.2091 50 46V34C50 31.7909 48.2091 30 46 30H14Z" fill="url(#brand-gradient)"/>
+          <defs>
+            <linearGradient id="brand-gradient" x1="0" y1="0" x2="100" y2="146" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#0E1AFD"/>
+              <stop offset="1" stop-color="#E4BFF1"/>
+            </linearGradient>
+          </defs>
+        </svg>
+        <div class="brand-block">
+          <p class="kicker">SHORT × UMAMI SYNC</p>
+          <h1 class="brand-title">Dashboard</h1>
         </div>
-        {{if .Message}}<div class="notice success">{{.Message}}</div>{{end}}
-        {{if .Error}}<div class="notice error">{{.Error}}</div>{{end}}
-      </section>
-      <div class="actions">
-        <a class="btn primary" href="#settings">Settings</a>
-        <a class="btn" href="#mappings">Mappings</a>
-        <a class="btn" href="#events">Events</a>
-        <a class="btn" href="/logout">Log out</a>
       </div>
-    </div>
+      <div class="topbar-right">
+        <nav class="tabs">
+          <a href="#overview" class="tab active">Overview</a>
+          <a href="#mappings" class="tab">Mappings <span class="count">{{len .Mappings}}</span></a>
+          <a href="#events" class="tab">Events <span class="count">{{len .Events}}</span></a>
+          <a href="#settings" class="tab">Settings</a>
+        </nav>
+        <span class="status"><span class="status-dot"></span>all systems normal</span>
+        <a class="btn ghost" href="/logout">Log out</a>
+      </div>
+    </header>
 
-    <section class="grid">
-      <article class="card settings" id="settings">
-        <div class="section-head">
-          <div>
-            <h2>Settings</h2>
-            <p class="muted tiny">Saved to Postgres and applied immediately.</p>
-          </div>
+    {{if .Message}}<div class="notice success"><span class="dot"></span><span>{{.Message}}</span></div>{{end}}
+    {{if .Error}}<div class="notice error"><span class="dot"></span><span>{{.Error}}</span></div>{{end}}
+
+    <section class="hero" id="overview">
+      <div>
+        <p class="kicker" style="margin-bottom: 14px;">Forwarding · recent activity</p>
+        <h1 class="title">
+          {{.Forwarded}} click{{if ne .Forwarded 1}}s{{end}} routed<br>to Umami.
+        </h1>
+        <p class="subtle" style="margin-top: 14px; max-width: 56ch;">
+          Each Short.io domain has its own webhook URL. Clicks are normalized and forwarded to the configured Umami site.
+        </p>
+      </div>
+      <div class="stats">
+        <div>
+          <div class="stat-label">Forwarded</div>
+          <div class="stat-value">{{.Forwarded}}</div>
         </div>
-        <form class="form" method="post" action="/dashboard/settings">
-          <label>Umami Endpoint
-            <input type="text" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://stats.brayden.me/bray">
-            <span class="muted tiny">A path is allowed here; if you enter stats.brayden.me/bray, https:// is added automatically.</span>
-          </label>
-          <label>Umami API Token
-            <input type="text" name="umami_api_key" value="{{.UmamiAPIKey}}" placeholder="optional bearer token">
-          </label>
-          <label>Fallback Site ID
-            <input type="text" name="umami_website_id" value="{{.DefaultPropertyID}}" placeholder="umami-site-id">
-          </label>
-          <div class="toolbar">
-            <span class="muted tiny">Used when a mapping doesn’t exist.</span>
-            <button class="primary" type="submit">Save</button>
-          </div>
-        </form>
-      </article>
-
-      <article class="card mappings" id="mappings">
-        <div class="section-head">
-          <div>
-            <h2>Mappings</h2>
-            <p class="muted tiny">Each domain gets its own webhook URL.</p>
-          </div>
+        <div>
+          <div class="stat-label">Errors</div>
+          <div class="stat-value{{if gt .Errors 0}} danger{{end}}">{{.Errors}}</div>
         </div>
-        <form class="form" method="post" action="/dashboard/mappings">
-          <div class="mapping-fields">
-            <label>Short.io domain
-              <input type="text" name="domain" placeholder="example.short.gy">
-            </label>
-            <label>Umami Site ID
-              <input type="text" name="property_id" placeholder="umami-site-id">
-            </label>
-          </div>
-          <div class="toolbar">
-            <span class="muted tiny">Domains are normalized before saving.</span>
-            <button class="primary" type="submit">Add mapping</button>
-          </div>
-        </form>
+        <div>
+          <div class="stat-label">Recent</div>
+          <div class="stat-value">{{.TotalEvents}}</div>
+        </div>
+      </div>
+    </section>
 
-        <div class="events-list" style="margin-top: 16px;">
+    <div class="grid">
+      <div class="col">
+        <section class="card" id="settings">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow" style="margin-bottom: 6px;">Forwarding</p>
+              <h2 class="h2">Umami destination</h2>
+            </div>
+          </div>
+          <form method="post" action="/dashboard/settings" style="display: grid; gap: 14px;">
+            <div class="field">
+              <label for="umami_endpoint">Endpoint</label>
+              <input id="umami_endpoint" class="input" name="umami_endpoint" value="{{.UmamiEndpoint}}" placeholder="https://stats.example.com/api/send">
+              <span class="hint">A path is allowed; https:// is added if you omit it.</span>
+            </div>
+            <div class="field">
+              <label for="umami_api_key">API token</label>
+              <input id="umami_api_key" class="input" name="umami_api_key" value="{{.UmamiAPIKey}}" placeholder="optional bearer token">
+            </div>
+            <div class="field">
+              <label for="umami_website_id">Fallback site ID</label>
+              <input id="umami_website_id" class="input" name="umami_website_id" value="{{.DefaultPropertyID}}" placeholder="site uuid">
+              <span class="hint">Used when a domain isn't mapped.</span>
+            </div>
+            <div class="end" style="margin-top: 4px;">
+              <button class="btn primary" type="submit">Save</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card">
+          <p class="eyebrow" style="margin-bottom: 6px;">Reference</p>
+          <h2 class="h2" style="margin-bottom: 12px;">Webhook recipe</h2>
+          <pre class="payload">POST  /webhooks/shortio/{domain}
+
+{
+  "origin":     "example.com",
+  "path":       "/launch",
+  "referrer":   "...",
+  "user-agent": "..."
+}</pre>
+        </section>
+      </div>
+
+      <div class="col">
+        <section class="card" id="mappings">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow" style="margin-bottom: 6px;">Routing · {{len .Mappings}} active</p>
+              <h2 class="h2">Domain → Umami site</h2>
+            </div>
+          </div>
+
+          <form class="add-form" method="post" action="/dashboard/mappings">
+            <div class="add-form-row">
+              <div class="field">
+                <label for="new-domain">Short.io domain</label>
+                <input id="new-domain" class="input" name="domain" placeholder="example.short.gy">
+              </div>
+              <div class="field">
+                <label for="new-property">Umami site ID</label>
+                <input id="new-property" class="input" name="property_id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+              </div>
+            </div>
+            <div class="end">
+              <button class="btn primary" type="submit">Add mapping</button>
+            </div>
+          </form>
+
           {{if .Mappings}}
             {{range .Mappings}}
               <div class="mapping">
-                <div class="mapping-top">
-                  <div>
-                    <div class="mapping-title"><code>{{.Domain}}</code></div>
-                    <div class="mapping-url">
-                      <span>{{printf "/webhooks/shortio/%s" .Domain}}</span>
-                      <button class="secondary" type="button" onclick="copyWebhook('{{.Domain}}', this)">Copy Webhook</button>
-                    </div>
-                  </div>
-                  <div class="row-actions">
-                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}—{{end}}</span>
-                    <span class="chip"><strong>Updated</strong> {{.UpdatedAt.Format "2006-01-02 15:04 MST"}}</span>
-                  </div>
+                <div class="left">
+                  <div class="domain">{{.Domain}}</div>
+                  <div class="webhook">/webhooks/shortio/{{.Domain}}</div>
+                  <div class="property">{{.PropertyID}}</div>
+                </div>
+                <div class="right">
+                  <button class="btn ghost" type="button" onclick="copyWebhook('{{.Domain}}', this)">Copy</button>
+                  <form method="post" action="/dashboard/mappings/delete" style="display: inline-flex;">
+                    <input type="hidden" name="domain" value="{{.Domain}}">
+                    <button class="btn danger" type="submit" aria-label="delete mapping">Delete</button>
+                  </form>
                 </div>
               </div>
             {{end}}
           {{else}}
-            <p class="muted tiny">No mappings yet.</p>
+            <p class="tiny" style="padding: 16px 0;">No mappings yet — add one above and paste the webhook URL into Short.io.</p>
           {{end}}
-        </div>
-      </article>
+        </section>
 
-      <article class="card events" id="events">
-        <div class="section-head">
-          <div>
-            <h2>Events</h2>
-            <p class="muted tiny">Recent webhook activity.</p>
+        <section class="card" id="events">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow" style="margin-bottom: 6px;">Activity · last {{.TotalEvents}} event{{if ne .TotalEvents 1}}s{{end}}</p>
+              <h2 class="h2">Recent events</h2>
+            </div>
+            <span class="status"><span class="status-dot"></span>streaming</span>
           </div>
-        </div>
-        <div class="events-list" id="events-list">
-          {{if .Events}}
-            {{range .Events}}
-              <div class="event">
-                <div class="event-head">
-                  <div>
-                    <div class="badge">{{.Source}}</div>
-                    <div style="margin-top: 8px; font-weight: 700;">{{.ReceivedAt.Format "2006-01-02 15:04 MST"}}</div>
+          <div id="events-list">
+            {{if .Events}}
+              {{range .Events}}
+                <div class="event">
+                  <div class="event-head">
+                    <div class="event-meta">
+                      <span class="event-time">{{.ReceivedAt.Format "15:04:05"}}</span>
+                      <span class="event-domain">{{if .Domain}}{{.Domain}}{{else}}—{{end}}</span>
+                      <span class="event-property">{{if .PropertyID}}{{.PropertyID}}{{else}}—{{end}}</span>
+                    </div>
+                    {{if .Forwarded}}
+                      <span class="badge green"><span class="dot"></span>forwarded</span>
+                    {{else}}
+                      <span class="badge red"><span class="dot"></span>failed</span>
+                    {{end}}
                   </div>
-                  <div class="row-actions">
-                    <span class="chip"><strong>Domain</strong> {{if .Domain}}{{.Domain}}{{else}}—{{end}}</span>
-                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}—{{end}}</span>
-                    <span class="chip"><strong>Forwarded</strong> {{.Forwarded}}</span>
-                  </div>
+                  {{if .ForwardError}}<div class="event-error">{{.ForwardError}}</div>{{end}}
+                  <details class="event-payload"><summary>Payload</summary><pre class="payload">{{printf "%s" .Payload}}</pre></details>
                 </div>
-                {{if .ForwardError}}<div class="notice error" style="margin-top:12px;">{{.ForwardError}}</div>{{end}}
-                <pre>{{printf "%s" .Payload}}</pre>
-              </div>
+              {{end}}
+            {{else}}
+              <p class="tiny">No events received yet.</p>
             {{end}}
-          {{else}}
-            <p class="muted tiny">No events received yet.</p>
-          {{end}}
-        </div>
-      </article>
-    </section>
+          </div>
+        </section>
+      </div>
+    </div>
   </main>
 </body>
 </html>`
+
