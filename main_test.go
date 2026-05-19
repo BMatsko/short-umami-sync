@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,6 +209,43 @@ func TestNormalizeUmamiScreen(t *testing.T) {
 				t.Fatalf("normalizeUmamiScreen(%q) = %q, want %q", tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRetainingLogWriterPrunesEntriesOlderThanRetention(t *testing.T) {
+	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-2 * time.Hour).Format(persistentLogTimestampFm) + " old entry"
+	recent := now.Add(-30 * time.Minute).Format(persistentLogTimestampFm) + " recent entry"
+	continuation := "  stack frame for recent entry"
+	contents := strings.Join([]string{old, recent, continuation, ""}, "\n")
+
+	path := filepath.Join(t.TempDir(), "test.log")
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open log: %v", err)
+	}
+	defer file.Close()
+
+	writer := &retainingLogWriter{file: file, path: path, retention: time.Hour}
+	if err := writer.prune(now); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after prune: %v", err)
+	}
+	if strings.Contains(string(got), "old entry") {
+		t.Fatalf("expected old entry to be pruned, got %q", got)
+	}
+	if !strings.Contains(string(got), "recent entry") {
+		t.Fatalf("expected recent entry to be kept, got %q", got)
+	}
+	if !strings.Contains(string(got), "stack frame for recent entry") {
+		t.Fatalf("expected continuation line to be kept, got %q", got)
 	}
 }
 

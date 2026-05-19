@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -19,6 +20,13 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+const (
+	persistentLogPath        = "/data/short-umami-sync.log"
+	persistentLogRetention   = time.Hour
+	persistentLogPruneEvery  = 5 * time.Minute
+	persistentLogTimestampFm = "2006/01/02 15:04:05.000000"
 )
 
 type Event struct {
@@ -243,10 +251,12 @@ func (a *app) loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.FormValue("password") != a.password {
+			log.Printf("event=login_failed remote=%q ua=%q", r.RemoteAddr, r.UserAgent())
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = a.tmplLogin.Execute(w, map[string]any{"Error": "Incorrect password."})
 			return
 		}
+		log.Printf("event=login_success remote=%q", r.RemoteAddr)
 		http.SetCookie(w, a.sessionCookie())
 		http.Redirect(w, r, "/dashboard", http.StatusFound)
 	default:
@@ -313,9 +323,11 @@ func (a *app) mappingUpsertHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.upsertMapping(r.Context(), domain, propertyID); err != nil {
+		log.Printf("event=mapping_upsert_failed domain=%q error=%q", domain, err)
 		redirectWithError(w, r, "save failed: "+err.Error())
 		return
 	}
+	log.Printf("event=mapping_upserted domain=%q property_id=%q", domain, propertyID)
 	redirectWithMessage(w, r, fmt.Sprintf("Saved mapping for %s", domain))
 }
 
@@ -334,9 +346,11 @@ func (a *app) mappingDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.deleteMapping(r.Context(), domain); err != nil {
+		log.Printf("event=mapping_delete_failed domain=%q error=%q", domain, err)
 		redirectWithError(w, r, "delete failed: "+err.Error())
 		return
 	}
+	log.Printf("event=mapping_deleted domain=%q", domain)
 	redirectWithMessage(w, r, fmt.Sprintf("Deleted mapping for %s", domain))
 }
 
@@ -355,11 +369,13 @@ func (a *app) settingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	defaultPropertyID := strings.TrimSpace(r.FormValue("umami_website_id"))
 
 	if err := a.saveSettings(r.Context(), endpoint, apiKey, defaultPropertyID); err != nil {
+		log.Printf("event=settings_save_failed error=%q", err)
 		redirectWithError(w, r, "save failed: "+err.Error())
 		return
 	}
 
 	a.setSettings(endpoint, apiKey, defaultPropertyID)
+	log.Printf("event=settings_saved endpoint=%q api_key_set=%t default_property_id=%q", endpoint, apiKey != "", defaultPropertyID)
 	redirectWithMessage(w, r, "Saved settings")
 }
 
@@ -1042,12 +1058,89 @@ func setupPersistentLogging() {
 		log.Printf("failed to create /data for logs: %v", err)
 		return
 	}
-	file, err := os.OpenFile("/data/short-umami-sync.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(persistentLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		log.Printf("failed to open persistent log file: %v", err)
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stdout, file))
+	writer := &retainingLogWriter{file: file, path: persistentLogPath, retention: persistentLogRetention}
+	log.SetOutput(io.MultiWriter(os.Stdout, writer))
+	go writer.runPruner(persistentLogPruneEvery)
+}
+
+type retainingLogWriter struct {
+	mu        sync.Mutex
+	file      *os.File
+	path      string
+	retention time.Duration
+}
+
+func (w *retainingLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Write(p)
+}
+
+func (w *retainingLogWriter) runPruner(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := w.prune(time.Now().UTC()); err != nil {
+			fmt.Fprintf(os.Stdout, "log pruner: %v\n", err)
+		}
+	}
+}
+
+func (w *retainingLogWriter) prune(now time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	data, err := os.ReadFile(w.path)
+	if err != nil {
+		return err
+	}
+
+	cutoff := now.Add(-w.retention)
+	lines := bytes.Split(data, []byte("\n"))
+	keep := make([][]byte, 0, len(lines))
+	keeping := false
+	for _, line := range lines {
+		if keeping {
+			keep = append(keep, line)
+			continue
+		}
+		ts, ok := parseLogLineTimestamp(line)
+		if !ok {
+			continue
+		}
+		if !ts.Before(cutoff) {
+			keeping = true
+			keep = append(keep, line)
+		}
+	}
+
+	rewritten := bytes.Join(keep, []byte("\n"))
+	if err := w.file.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := w.file.Write(rewritten); err != nil {
+		return err
+	}
+	return w.file.Sync()
+}
+
+func parseLogLineTimestamp(line []byte) (time.Time, bool) {
+	if len(line) < len(persistentLogTimestampFm) {
+		return time.Time{}, false
+	}
+	ts, err := time.ParseInLocation(persistentLogTimestampFm, string(line[:len(persistentLogTimestampFm)]), time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 const loginTemplate = `<!doctype html>
@@ -1493,7 +1586,7 @@ const dashboardTemplate = `<!doctype html>
             <input type="text" name="umami_website_id" value="{{.DefaultPropertyID}}" placeholder="umami-site-id">
           </label>
           <div class="toolbar">
-            <span class="muted tiny">Used when a mapping doesn\u2019t exist.</span>
+            <span class="muted tiny">Used when a mapping doesn’t exist.</span>
             <button class="primary" type="submit">Save</button>
           </div>
         </form>
@@ -1534,7 +1627,7 @@ const dashboardTemplate = `<!doctype html>
                     </div>
                   </div>
                   <div class="row-actions">
-                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}\u2014{{end}}</span>
+                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}—{{end}}</span>
                     <span class="chip"><strong>Updated</strong> {{.UpdatedAt.Format "2006-01-02 15:04 MST"}}</span>
                   </div>
                 </div>
@@ -1563,8 +1656,8 @@ const dashboardTemplate = `<!doctype html>
                     <div style="margin-top: 8px; font-weight: 700;">{{.ReceivedAt.Format "2006-01-02 15:04 MST"}}</div>
                   </div>
                   <div class="row-actions">
-                    <span class="chip"><strong>Domain</strong> {{if .Domain}}{{.Domain}}{{else}}\u2014{{end}}</span>
-                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}\u2014{{end}}</span>
+                    <span class="chip"><strong>Domain</strong> {{if .Domain}}{{.Domain}}{{else}}—{{end}}</span>
+                    <span class="chip"><strong>Site</strong> {{if .PropertyID}}{{.PropertyID}}{{else}}—{{end}}</span>
                     <span class="chip"><strong>Forwarded</strong> {{.Forwarded}}</span>
                   </div>
                 </div>
