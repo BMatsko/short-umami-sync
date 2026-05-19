@@ -737,15 +737,28 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
+	log.Printf("event=umami_forward_request endpoint=%q domain=%q property_id=%q resolved_from=%s user_agent=%q visitor_ip=%q referrer=%q auth=%t body=%s",
+		endpoint, domain, propertyID, resolvedFrom, visitorUserAgent, visitorIP, referrer, apiKey != "", string(b))
+
 	client := &http.Client{Timeout: 10 * time.Second}
+	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("event=umami_forward_transport_error endpoint=%q domain=%q property_id=%q elapsed_ms=%d error=%q",
+			endpoint, domain, propertyID, time.Since(start).Milliseconds(), err.Error())
 		return false, err.Error()
 	}
 	defer resp.Body.Close()
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if readErr != nil {
+		log.Printf("event=umami_forward_response_read_error endpoint=%q domain=%q property_id=%q status=%q elapsed_ms=%d error=%q",
+			endpoint, domain, propertyID, resp.Status, time.Since(start).Milliseconds(), readErr.Error())
+	}
+	log.Printf("event=umami_forward_response endpoint=%q domain=%q property_id=%q status=%q elapsed_ms=%d response_content_type=%q body=%s",
+		endpoint, domain, propertyID, resp.Status, time.Since(start).Milliseconds(), resp.Header.Get("Content-Type"), strings.TrimSpace(string(respBody)))
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return false, fmt.Sprintf("umami returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return false, fmt.Sprintf("umami returned %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
 	}
 	return true, ""
 }
