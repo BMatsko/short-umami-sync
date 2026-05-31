@@ -192,6 +192,69 @@ func TestForwardToUmamiHandlesShortioWebhookFieldsAndOmitsInvalidScreen(t *testi
 	}
 }
 
+func TestExtractStringFieldDoesNotLeakUnrelatedNestedStrings(t *testing.T) {
+	// Real Short.io webhooks nest the click fields under an object such as
+	// "link". The extractor must resolve keys from nested containers without
+	// returning an arbitrary sibling string when the key is absent.
+	payload := map[string]any{
+		"link":      map[string]any{"domain": "sho.rt", "path": "abc"},
+		"referrer":  "https://example.com",
+		"userAgent": "Mozilla/5.0",
+	}
+
+	if got := extractStringField(payload, "path", "slug", "url", "uri"); got != "abc" {
+		t.Fatalf("path = %q, want abc", got)
+	}
+	if got := extractStringField(payload, "origin", "shortDomain", "hostname", "domain"); got != "sho.rt" {
+		t.Fatalf("domain = %q, want sho.rt", got)
+	}
+	// No language/ip field exists anywhere, so the extractor must report empty
+	// rather than leaking the referrer or short domain.
+	if got := extractStringField(payload, "language", "accept-language"); got != "" {
+		t.Fatalf("language = %q, want empty", got)
+	}
+	if got := extractStringField(payload, "ip", "visitor_ip", "remote_addr"); got != "" {
+		t.Fatalf("ip = %q, want empty", got)
+	}
+}
+
+func TestForwardToUmamiResolvesNestedShortioFields(t *testing.T) {
+	var receivedPayload map[string]any
+	var receivedVisitorIP string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedVisitorIP = r.Header.Get("X-Forwarded-For")
+		if err := json.NewDecoder(r.Body).Decode(&receivedPayload); err != nil {
+			t.Fatalf("decode forwarded payload: %v", err)
+		}
+		w.WriteHeader(204)
+	}))
+	defer server.Close()
+
+	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
+	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{
+		"link":{"domain":"sho.rt","path":"abc"},
+		"referrer":"https://example.com",
+		"userAgent":"Mozilla/5.0"
+	}`), "sho.rt", "website-123", "payload", server.URL+"/api/send", "")
+	if !ok || forwardErr != "" {
+		t.Fatalf("forwardToUmami() = (%v, %q), want success", ok, forwardErr)
+	}
+
+	payload, ok := receivedPayload["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want object", receivedPayload["payload"])
+	}
+	if payload["url"] != "/abc" {
+		t.Fatalf("url = %#v, want /abc", payload["url"])
+	}
+	if _, exists := payload["language"]; exists {
+		t.Fatalf("language = %#v, want omitted", payload["language"])
+	}
+	if receivedVisitorIP != "" {
+		t.Fatalf("X-Forwarded-For = %q, want empty (no IP in payload)", receivedVisitorIP)
+	}
+}
+
 func TestNormalizeUmamiScreen(t *testing.T) {
 	tests := []struct {
 		name string
@@ -214,8 +277,8 @@ func TestNormalizeUmamiScreen(t *testing.T) {
 
 func TestRetainingLogWriterPrunesEntriesOlderThanRetention(t *testing.T) {
 	now := time.Date(2026, 5, 19, 12, 0, 0, 0, time.UTC)
-	old := now.Add(-2 * time.Hour).Format(persistentLogTimestampFm) + " old entry"
-	recent := now.Add(-30 * time.Minute).Format(persistentLogTimestampFm) + " recent entry"
+	old := now.Add(-2*time.Hour).Format(persistentLogTimestampFm) + " old entry"
+	recent := now.Add(-30*time.Minute).Format(persistentLogTimestampFm) + " recent entry"
 	continuation := "  stack frame for recent entry"
 	contents := strings.Join([]string{old, recent, continuation, ""}, "\n")
 
