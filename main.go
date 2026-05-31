@@ -787,9 +787,16 @@ func extractStringField(value any, keys ...string) string {
 				}
 			}
 		}
+		// Fall back to nested containers only. Recursing into scalar values
+		// here would return an arbitrary string regardless of its key, so we
+		// descend exclusively into maps and slices and rely on the keyed
+		// lookup above to match the field we actually want.
 		for _, raw := range v {
-			if s := extractStringField(raw, keys...); s != "" {
-				return s
+			switch raw.(type) {
+			case map[string]any, []any:
+				if s := extractStringField(raw, keys...); s != "" {
+					return s
+				}
 			}
 		}
 	case []any:
@@ -798,8 +805,6 @@ func extractStringField(value any, keys ...string) string {
 				return s
 			}
 		}
-	case string:
-		return strings.TrimSpace(v)
 	}
 	return ""
 }
