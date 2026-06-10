@@ -676,6 +676,11 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	if !strings.HasPrefix(requestURL, "/") {
 		requestURL = "/" + strings.TrimLeft(requestURL, "/")
 	}
+	// Short.io sends the destination query string separately; appending it lets
+	// Umami pick up utm_* and click IDs from the URL.
+	if query := normalizeShortioQuery(extractStringField(decoded, "shortLinkQuery", "short_link_query")); query != "" && !strings.Contains(requestURL, "?") {
+		requestURL += "?" + query
+	}
 
 	title := meta.Title
 	if title == "" {
@@ -702,12 +707,14 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		visitorUserAgent = "Short-Umami-Sync/1.0"
 	}
 
+	// No "name" field: a payload without an event name is recorded as a
+	// pageview, which is what populates Views/Visitors on the Umami overview.
+	// A named payload becomes a custom event that only shows in the Events tab.
 	umamiPayload := map[string]any{
 		"hostname": hostname,
 		"title":    title,
 		"url":      requestURL,
 		"website":  propertyID,
-		"name":     "shortio-click",
 	}
 	setIfNotEmpty(umamiPayload, "language", language)
 	setIfNotEmpty(umamiPayload, "referrer", referrer)
@@ -760,7 +767,37 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return false, fmt.Sprintf("umami returned %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
 	}
+	// Umami answers {"beep":"boop"} with 200 OK when its bot detection drops
+	// the event, so a 200 alone does not mean the click was recorded.
+	if strings.Contains(string(respBody), `"beep"`) {
+		log.Printf("event=umami_forward_ignored endpoint=%q domain=%q property_id=%q user_agent=%q reason=bot_user_agent",
+			endpoint, domain, propertyID, visitorUserAgent)
+		return true, "umami ignored event: bot user agent detected"
+	}
 	return true, ""
+}
+
+// normalizeShortioQuery cleans the shortLinkQuery value Short.io sends with
+// click webhooks. Short.io serializes missing values as the literal string
+// "null", and parameters with that value (e.g. utm_source=null) are dropped.
+func normalizeShortioQuery(raw string) string {
+	value := strings.TrimPrefix(strings.TrimSpace(raw), "?")
+	if value == "" || value == "null" {
+		return ""
+	}
+	parsed, err := url.ParseQuery(value)
+	if err != nil {
+		return value
+	}
+	cleaned := url.Values{}
+	for key, vals := range parsed {
+		for _, v := range vals {
+			if v != "null" {
+				cleaned.Add(key, v)
+			}
+		}
+	}
+	return cleaned.Encode()
 }
 
 func extractShortioMetadata(value any) shortioMetadata {
@@ -1650,4 +1687,3 @@ const dashboardTemplate = `<!doctype html>
   </main>
 </body>
 </html>`
-

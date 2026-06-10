@@ -28,4 +28,6 @@ Go backend for accepting Short.io webhooks, showing them in a password-protected
 - The dashboard shows recent webhook events in memory for visibility.
 - When a webhook arrives, the app resolves the Short.io domain to a mapped Umami property ID and includes that property in the forwarded payload.
 - Short.io click webhooks are normalized from JSON or form-encoded payloads. The receiver recognizes Short.io fields such as `Origin`, `Path`, `Referrer`, `User-agent`, and `Host` regardless of case or hyphen/underscore style.
-- Umami forwarding uses the current `/api/send` shape with `type: "event"`, event name `shortio-click`, and omits invalid `screen` values unless they are resolution strings such as `1920x1080`.
+- Umami forwarding uses the current `/api/send` shape with `type: "event"` and no event name, so clicks are recorded as pageviews and appear in the Umami overview (Views/Visitors/Pages). The short link's `shortLinkQuery` is appended to the forwarded URL (minus `null` placeholders) so UTM parameters and click IDs reach Umami.
+- Umami silently drops events whose forwarded `User-Agent` looks like a bot (it responds `{"beep":"boop"}`); these are marked with a note in the dashboard instead of being counted as recorded.
+- Invalid `screen` values are omitted unless they are resolution strings such as `1920x1080`.
