@@ -93,8 +93,7 @@ func TestForwardToUmamiBuildsTrackingPayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
-	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{
+	ok, forwardErr := (&app{}).forwardToUmami(requestContext{}, json.RawMessage(`{
 		"domain":"sho.rt",
 		"path":"offer",
 		"title":"Spring Offer",
@@ -147,8 +146,7 @@ func TestForwardToUmamiAppendsShortLinkQueryAndDropsNullParams(t *testing.T) {
 	}))
 	defer server.Close()
 
-	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
-	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{
+	ok, forwardErr := (&app{}).forwardToUmami(requestContext{}, json.RawMessage(`{
 		"path":"/offer",
 		"shortLinkQuery":"fbclid=abc123&utm_source=null"
 	}`), "sho.rt", "website-123", "route", server.URL+"/api/send", "")
@@ -172,8 +170,7 @@ func TestForwardToUmamiSurfacesBotDrop(t *testing.T) {
 	}))
 	defer server.Close()
 
-	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
-	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{"path":"/x"}`), "sho.rt", "website-123", "route", server.URL+"/api/send", "")
+	ok, forwardErr := (&app{}).forwardToUmami(requestContext{}, json.RawMessage(`{"path":"/x"}`), "sho.rt", "website-123", "route", server.URL+"/api/send", "")
 	if !ok {
 		t.Fatalf("forwardToUmami() ok = false, want true for 200 response")
 	}
@@ -218,8 +215,7 @@ func TestForwardToUmamiHandlesShortioWebhookFieldsAndOmitsInvalidScreen(t *testi
 	}))
 	defer server.Close()
 
-	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
-	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{
+	ok, forwardErr := (&app{}).forwardToUmami(requestContext{}, json.RawMessage(`{
 		"Origin":"sho.rt",
 		"Path":"AbC123",
 		"Referrer":"https://example.com/source",
@@ -296,8 +292,7 @@ func TestForwardToUmamiResolvesNestedShortioFields(t *testing.T) {
 	}))
 	defer server.Close()
 
-	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
-	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{
+	ok, forwardErr := (&app{}).forwardToUmami(requestContext{}, json.RawMessage(`{
 		"link":{"domain":"sho.rt","path":"abc"},
 		"referrer":"https://example.com",
 		"userAgent":"Mozilla/5.0"
@@ -375,6 +370,84 @@ func TestRetainingLogWriterPrunesEntriesOlderThanRetention(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "stack frame for recent entry") {
 		t.Fatalf("expected continuation line to be kept, got %q", got)
+	}
+}
+
+func TestDecodeShortioClicks(t *testing.T) {
+	bare := []byte(`[{"dt":"2026-06-10T12:00:00.000Z","ip":"::ffff:203.0.113.7","path":"/abc"}]`)
+	clicks, err := decodeShortioClicks(bare)
+	if err != nil || len(clicks) != 1 || clicks[0].IP != "::ffff:203.0.113.7" {
+		t.Fatalf("decodeShortioClicks(bare) = %#v, %v", clicks, err)
+	}
+
+	wrapped := []byte(`{"clicks":[{"dt":"2026-06-10T12:00:00.000Z","path":"/abc"}]}`)
+	clicks, err = decodeShortioClicks(wrapped)
+	if err != nil || len(clicks) != 1 || clicks[0].Path != "/abc" {
+		t.Fatalf("decodeShortioClicks(wrapped) = %#v, %v", clicks, err)
+	}
+}
+
+func TestMatchShortioClick(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	clicks := []shortioLastClick{
+		{DT: "2026-06-10T11:58:00.000Z", IP: "198.51.100.1", Path: "/other", UA: "UA-1"},
+		{DT: "2026-06-10T11:50:00.000Z", IP: "198.51.100.2", Path: "/abc", UA: "UA-1"},
+		{DT: "2026-06-10T11:59:00.000Z", IP: "198.51.100.3", Path: "/abc", UA: "UA-1"},
+		{DT: "2026-06-10T10:00:00.000Z", IP: "198.51.100.4", Path: "/abc", UA: "UA-1"},
+	}
+
+	got := matchShortioClick(clicks, "/abc", "UA-1", now)
+	if got == nil || got.IP != "198.51.100.3" {
+		t.Fatalf("matchShortioClick = %#v, want newest matching click 198.51.100.3", got)
+	}
+	if got := matchShortioClick(clicks, "/abc", "UA-other", now); got != nil {
+		t.Fatalf("matchShortioClick with mismatched UA = %#v, want nil", got)
+	}
+	if got := matchShortioClick(clicks, "/missing", "", now); got != nil {
+		t.Fatalf("matchShortioClick for unknown path = %#v, want nil", got)
+	}
+}
+
+func TestEnrichShortioPayloadAddsIPAndReferrer(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/domains" {
+			t.Fatalf("unexpected api path %q", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "sk_test" {
+			t.Fatalf("Authorization = %q, want sk_test", r.Header.Get("Authorization"))
+		}
+		_, _ = w.Write([]byte(`[{"id":42,"hostname":"sho.rt","state":"configured","hideVisitorIp":false}]`))
+	}))
+	defer apiServer.Close()
+
+	statsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/domain/42/last_clicks" {
+			t.Fatalf("unexpected stats path %q", r.URL.Path)
+		}
+		dt := time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339)
+		_, _ = w.Write([]byte(`[{"dt":"` + dt + `","ip":"::ffff:203.0.113.7","path":"/abc","ua":"UA-1","ref":"https://example.com","country":"United States","city":"Santa Clara"}]`))
+	}))
+	defer statsServer.Close()
+
+	oldAPI, oldStats := shortioAPIBase, shortioStatsBase
+	shortioAPIBase, shortioStatsBase = apiServer.URL, statsServer.URL
+	defer func() { shortioAPIBase, shortioStatsBase = oldAPI, oldStats }()
+
+	payload := json.RawMessage(`{"path":"/abc","userAgent":"UA-1","language":"en-US"}`)
+	enriched := (&app{}).enrichShortioPayload(context.Background(), "sk_test", "sho.rt", payload)
+
+	var decoded map[string]any
+	if err := json.Unmarshal(enriched, &decoded); err != nil {
+		t.Fatalf("enriched payload invalid JSON: %v", err)
+	}
+	if decoded["ip"] != "203.0.113.7" {
+		t.Fatalf("ip = %#v, want 203.0.113.7 (with ::ffff: prefix stripped)", decoded["ip"])
+	}
+	if decoded["referrer"] != "https://example.com" {
+		t.Fatalf("referrer = %#v, want https://example.com", decoded["referrer"])
+	}
+	if decoded["country"] != "United States" {
+		t.Fatalf("country = %#v, want United States", decoded["country"])
 	}
 }
 

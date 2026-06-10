@@ -64,6 +64,10 @@ type app struct {
 	umamiEndpoint    string
 	umamiAPIKey      string
 	umamiDefaultProp string
+	shortioAPIKey    string
+	shortioMu        sync.Mutex
+	shortioDomains   map[string]shortioDomainInfo
+	shortioDomainsAt time.Time
 	mu               sync.Mutex
 	events           []Event
 	tmplLogin        *template.Template
@@ -73,6 +77,7 @@ type app struct {
 func main() {
 	setupPersistentLogging()
 	cfg := mustNewApp()
+	go cfg.logShortioDiagnostics(cfg.settingsSnapshot().ShortioAPIKey)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -138,6 +143,7 @@ func mustNewApp() *app {
 		umamiEndpoint:    normalizeUmamiEndpoint(settingOrEnv(storedSettings, "umami_endpoint", "UMAMI_ENDPOINT")),
 		umamiAPIKey:      settingOrEnvAny(storedSettings, "umami_api_key", "UMAMI_API_TOKEN", "UMAMI_API_KEY"),
 		umamiDefaultProp: settingOrEnvAny(storedSettings, "umami_website_id", "FALLBACK_SITE_ID", "UMAMI_WEBSITE_ID"),
+		shortioAPIKey:    settingOrEnvAny(storedSettings, "shortio_api_key", "SHORTIO_API_KEY"),
 		tmplLogin:        template.Must(template.New("login").Parse(loginTemplate)),
 		tmplDash:         template.Must(template.New("dashboard").Parse(dashboardTemplate)),
 	}
@@ -302,6 +308,7 @@ func (a *app) dashboardHandler(w http.ResponseWriter, r *http.Request) {
 		"UmamiEndpoint":     settings.Endpoint,
 		"UmamiAPIKey":       settings.APIKey,
 		"DefaultPropertyID": settings.DefaultPropertyID,
+		"ShortioAPIKey":     settings.ShortioAPIKey,
 		"Forwarded":         forwarded,
 		"Errors":            errored,
 		"TotalEvents":       len(events),
@@ -380,15 +387,17 @@ func (a *app) settingsUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	endpoint := normalizeUmamiEndpoint(strings.TrimSpace(r.FormValue("umami_endpoint")))
 	apiKey := strings.TrimSpace(r.FormValue("umami_api_key"))
 	defaultPropertyID := strings.TrimSpace(r.FormValue("umami_website_id"))
+	shortioAPIKey := strings.TrimSpace(r.FormValue("shortio_api_key"))
 
-	if err := a.saveSettings(r.Context(), endpoint, apiKey, defaultPropertyID); err != nil {
+	if err := a.saveSettings(r.Context(), endpoint, apiKey, defaultPropertyID, shortioAPIKey); err != nil {
 		log.Printf("event=settings_save_failed error=%q", err)
 		redirectWithError(w, r, "save failed: "+err.Error())
 		return
 	}
 
-	a.setSettings(endpoint, apiKey, defaultPropertyID)
-	log.Printf("event=settings_saved endpoint=%q api_key_set=%t default_property_id=%q", endpoint, apiKey != "", defaultPropertyID)
+	a.setSettings(endpoint, apiKey, defaultPropertyID, shortioAPIKey)
+	log.Printf("event=settings_saved endpoint=%q api_key_set=%t default_property_id=%q shortio_api_key_set=%t", endpoint, apiKey != "", defaultPropertyID, shortioAPIKey != "")
+	go a.logShortioDiagnostics(shortioAPIKey)
 	redirectWithMessage(w, r, "Saved settings")
 }
 
@@ -404,6 +413,7 @@ type runtimeSettings struct {
 	Endpoint          string
 	APIKey            string
 	DefaultPropertyID string
+	ShortioAPIKey     string
 }
 
 func (a *app) settingsSnapshot() runtimeSettings {
@@ -413,18 +423,20 @@ func (a *app) settingsSnapshot() runtimeSettings {
 		Endpoint:          a.umamiEndpoint,
 		APIKey:            a.umamiAPIKey,
 		DefaultPropertyID: a.umamiDefaultProp,
+		ShortioAPIKey:     a.shortioAPIKey,
 	}
 }
 
-func (a *app) setSettings(endpoint, apiKey, defaultPropertyID string) {
+func (a *app) setSettings(endpoint, apiKey, defaultPropertyID, shortioAPIKey string) {
 	a.settingsMu.Lock()
 	defer a.settingsMu.Unlock()
 	a.umamiEndpoint = normalizeUmamiEndpoint(endpoint)
 	a.umamiAPIKey = apiKey
 	a.umamiDefaultProp = defaultPropertyID
+	a.shortioAPIKey = shortioAPIKey
 }
 
-func (a *app) saveSettings(ctx context.Context, endpoint, apiKey, defaultPropertyID string) error {
+func (a *app) saveSettings(ctx context.Context, endpoint, apiKey, defaultPropertyID, shortioAPIKey string) error {
 	endpoint = normalizeUmamiEndpoint(endpoint)
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -433,10 +445,11 @@ func (a *app) saveSettings(ctx context.Context, endpoint, apiKey, defaultPropert
 		VALUES
 			('umami_endpoint', $1, now()),
 			('umami_api_key', $2, now()),
-			('umami_website_id', $3, now())
+			('umami_website_id', $3, now()),
+			('shortio_api_key', $4, now())
 		ON CONFLICT (key)
 		DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-	`, endpoint, apiKey, defaultPropertyID)
+	`, endpoint, apiKey, defaultPropertyID, shortioAPIKey)
 	return err
 }
 
@@ -554,19 +567,47 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if resolveErr != nil {
 		event.Forwarded = false
 		event.ForwardError = resolveErr.Error()
-	} else {
-		event.Forwarded, event.ForwardError = a.forwardToUmami(r, payload, domainForEvent, propertyID, resolvedFrom, settings.Endpoint, settings.APIKey)
-		if event.Forwarded {
-			log.Printf("event=webhook_forwarded source=shortio format=%s path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s", payloadFormat, r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom)
-		} else {
-			log.Printf("event=webhook_forward_failed source=shortio format=%s path=%q route_key=%q payload_domain=%q property_id=%q resolved_from=%s error=%q", payloadFormat, r.URL.Path, routeKey, payloadDomain, propertyID, resolvedFrom, event.ForwardError)
+		if err := persistEvent(r.Context(), a.db, event); err != nil {
+			log.Printf("failed to persist event: %v", err)
 		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": false, "error": event.ForwardError, "domain": domainForEvent, "property_id": propertyID})
+		return
 	}
-	if err := persistEvent(r.Context(), a.db, event); err != nil {
+
+	// Enrichment can wait on Short.io's statistics pipeline, so respond to the
+	// webhook immediately and finish forwarding in the background.
+	rc := requestContext{Host: r.Host, UserAgent: r.UserAgent(), AcceptLanguage: strings.TrimSpace(r.Header.Get("Accept-Language"))}
+	go a.processShortioEvent(event, rc, resolvedFrom, settings)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "accepted": true, "domain": domainForEvent, "property_id": propertyID})
+}
+
+// requestContext carries the webhook request values needed after the handler
+// returns, since *http.Request must not be used from background goroutines.
+type requestContext struct {
+	Host           string
+	UserAgent      string
+	AcceptLanguage string
+}
+
+func (a *app) processShortioEvent(event Event, rc requestContext, resolvedFrom string, settings runtimeSettings) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	if settings.ShortioAPIKey != "" {
+		event.Payload = a.enrichShortioPayload(ctx, settings.ShortioAPIKey, event.Domain, event.Payload)
+	}
+
+	event.Forwarded, event.ForwardError = a.forwardToUmami(rc, event.Payload, event.Domain, event.PropertyID, resolvedFrom, settings.Endpoint, settings.APIKey)
+	if event.Forwarded {
+		log.Printf("event=webhook_forwarded source=shortio domain=%q property_id=%q resolved_from=%s", event.Domain, event.PropertyID, resolvedFrom)
+	} else {
+		log.Printf("event=webhook_forward_failed source=shortio domain=%q property_id=%q resolved_from=%s error=%q", event.Domain, event.PropertyID, resolvedFrom, event.ForwardError)
+	}
+	if err := persistEvent(ctx, a.db, event); err != nil {
 		log.Printf("failed to persist event: %v", err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "forwarded": event.Forwarded, "error": event.ForwardError, "domain": domainForEvent, "property_id": propertyID})
 }
 func parseShortioWebhookPayload(body []byte, contentType string) (json.RawMessage, string, error) {
 	trimmed := strings.TrimSpace(string(body))
@@ -648,7 +689,7 @@ func (a *app) resolvePropertyID(ctx context.Context, routeKey, payloadDomain, de
 	return "", "", fmt.Errorf("no domain mapping found for route key %q or payload domain %q", routeKey, payloadDomain)
 }
 
-func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, propertyID, resolvedFrom, endpoint, apiKey string) (bool, string) {
+func (a *app) forwardToUmami(rc requestContext, payload json.RawMessage, domain, propertyID, resolvedFrom, endpoint, apiKey string) (bool, string) {
 	endpoint = normalizeUmamiEndpoint(endpoint)
 	if endpoint == "" {
 		return false, "UMAMI_ENDPOINT is not configured"
@@ -666,7 +707,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 		hostname = domain
 	}
 	if hostname == "" {
-		hostname = normalizeDomain(r.Host)
+		hostname = normalizeDomain(rc.Host)
 	}
 
 	requestURL := meta.Path
@@ -692,7 +733,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 
 	language := extractStringField(decoded, "language", "accept-language", "accept_language")
 	if language == "" {
-		language = strings.TrimSpace(r.Header.Get("Accept-Language"))
+		language = rc.AcceptLanguage
 	}
 
 	screen := normalizeUmamiScreen(extractStringField(decoded, "screen", "screen_resolution", "screenResolution"))
@@ -701,7 +742,7 @@ func (a *app) forwardToUmami(r *http.Request, payload json.RawMessage, domain, p
 	visitorIP := meta.IP
 	visitorUserAgent := meta.UserAgent
 	if visitorUserAgent == "" {
-		visitorUserAgent = r.UserAgent()
+		visitorUserAgent = rc.UserAgent
 	}
 	if visitorUserAgent == "" {
 		visitorUserAgent = "Short-Umami-Sync/1.0"
@@ -798,6 +839,265 @@ func normalizeShortioQuery(raw string) string {
 		}
 	}
 	return cleaned.Encode()
+}
+
+// Overridable in tests.
+var (
+	shortioAPIBase   = "https://api.short.io"
+	shortioStatsBase = "https://statistics.short.io/statistics"
+)
+
+type shortioDomainInfo struct {
+	ID            int64  `json:"id"`
+	Hostname      string `json:"hostname"`
+	State         string `json:"state"`
+	HideVisitorIP bool   `json:"hideVisitorIp"`
+}
+
+type shortioLastClick struct {
+	DT      string `json:"dt"`
+	IP      string `json:"ip"`
+	Path    string `json:"path"`
+	UA      string `json:"ua"`
+	Ref     string `json:"ref"`
+	Country string `json:"country"`
+	City    string `json:"city"`
+}
+
+func fetchShortioDomains(ctx context.Context, apiKey string) ([]shortioDomainInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, shortioAPIBase+"/api/domains", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", apiKey)
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("short.io returned %s: %s", resp.Status, truncateForLog(body, 256))
+	}
+	var domains []shortioDomainInfo
+	if err := json.Unmarshal(body, &domains); err != nil {
+		return nil, fmt.Errorf("decode short.io domains: %w", err)
+	}
+	return domains, nil
+}
+
+// logShortioDiagnostics reports each domain's privacy configuration so the
+// logs explain why click IPs (and therefore Umami locations) may be missing.
+func (a *app) logShortioDiagnostics(apiKey string) {
+	if strings.TrimSpace(apiKey) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	domains, err := fetchShortioDomains(ctx, apiKey)
+	if err != nil {
+		log.Printf("event=shortio_domains_fetch_failed error=%q", err)
+		return
+	}
+	for _, d := range domains {
+		log.Printf("event=shortio_domain hostname=%q id=%d state=%q hide_visitor_ip=%t", d.Hostname, d.ID, d.State, d.HideVisitorIP)
+		if d.HideVisitorIP {
+			log.Printf("event=shortio_domain_warning hostname=%q warning=%q", d.Hostname,
+				"Hide visitor IP is enabled in Short.io; click IPs are unavailable, so Umami cannot derive visitor locations for this domain")
+		}
+	}
+}
+
+func (a *app) shortioDomainInfoFor(ctx context.Context, apiKey, domain string) (*shortioDomainInfo, error) {
+	domain = normalizeDomain(domain)
+	a.shortioMu.Lock()
+	if a.shortioDomains != nil && time.Since(a.shortioDomainsAt) < 10*time.Minute {
+		if info, ok := a.shortioDomains[domain]; ok {
+			a.shortioMu.Unlock()
+			return &info, nil
+		}
+	}
+	a.shortioMu.Unlock()
+
+	domains, err := fetchShortioDomains(ctx, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	cache := make(map[string]shortioDomainInfo, len(domains))
+	for _, d := range domains {
+		cache[normalizeDomain(d.Hostname)] = d
+	}
+	a.shortioMu.Lock()
+	a.shortioDomains = cache
+	a.shortioDomainsAt = time.Now()
+	a.shortioMu.Unlock()
+
+	if info, ok := cache[domain]; ok {
+		return &info, nil
+	}
+	return nil, fmt.Errorf("domain %q not found in Short.io account", domain)
+}
+
+func fetchShortioLastClicks(ctx context.Context, apiKey string, domainID int64) ([]shortioLastClick, error) {
+	body, err := json.Marshal(map[string]any{"limit": 25, "period": "today", "tz": "UTC"})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/domain/%d/last_clicks", shortioStatsBase, domainID), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("short.io statistics returned %s: %s", resp.Status, truncateForLog(data, 256))
+	}
+	return decodeShortioClicks(data)
+}
+
+// decodeShortioClicks tolerates the response being either a bare array or an
+// object wrapping the array under a common key.
+func decodeShortioClicks(data []byte) ([]shortioLastClick, error) {
+	var direct []shortioLastClick
+	if err := json.Unmarshal(data, &direct); err == nil {
+		return direct, nil
+	}
+	var wrapper map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("decode short.io clicks: %w", err)
+	}
+	for _, key := range []string{"clicks", "data", "rows", "lastClicks", "items"} {
+		raw, ok := wrapper[key]
+		if !ok {
+			continue
+		}
+		var clicks []shortioLastClick
+		if err := json.Unmarshal(raw, &clicks); err == nil {
+			return clicks, nil
+		}
+	}
+	return nil, fmt.Errorf("unrecognized short.io last_clicks response shape: %s", truncateForLog(data, 256))
+}
+
+// matchShortioClick finds the newest click matching the webhook's path and
+// user agent, no older than 15 minutes, so concurrent clicks on other links
+// don't cross-contaminate.
+func matchShortioClick(clicks []shortioLastClick, path, ua string, now time.Time) *shortioLastClick {
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	var best *shortioLastClick
+	var bestDT time.Time
+	for i := range clicks {
+		click := &clicks[i]
+		clickPath := click.Path
+		if clickPath == "" {
+			clickPath = "/"
+		}
+		if !strings.HasPrefix(clickPath, "/") {
+			clickPath = "/" + clickPath
+		}
+		if clickPath != path {
+			continue
+		}
+		if ua != "" && click.UA != "" && click.UA != ua {
+			continue
+		}
+		dt, err := time.Parse(time.RFC3339, click.DT)
+		if err != nil {
+			continue
+		}
+		if now.Sub(dt) > 15*time.Minute || dt.Sub(now) > 2*time.Minute {
+			continue
+		}
+		if best == nil || dt.After(bestDT) {
+			best = click
+			bestDT = dt
+		}
+	}
+	return best
+}
+
+// enrichShortioPayload fills in the visitor IP and referrer that Short.io's
+// webhook omits by matching the click in the Short.io statistics API. The IP
+// is what lets Umami derive the visitor's location.
+func (a *app) enrichShortioPayload(ctx context.Context, apiKey, domain string, payload json.RawMessage) json.RawMessage {
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil || decoded == nil {
+		return payload
+	}
+	meta := extractShortioMetadata(decoded)
+	if meta.IP != "" && meta.Referrer != "" {
+		return payload
+	}
+
+	info, err := a.shortioDomainInfoFor(ctx, apiKey, domain)
+	if err != nil {
+		log.Printf("event=shortio_enrich_skipped domain=%q error=%q", domain, err)
+		return payload
+	}
+
+	var click *shortioLastClick
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return payload
+			case <-time.After(3 * time.Second):
+			}
+		}
+		clicks, err := fetchShortioLastClicks(ctx, apiKey, info.ID)
+		if err != nil {
+			log.Printf("event=shortio_last_clicks_failed domain=%q attempt=%d error=%q", domain, attempt+1, err)
+			continue
+		}
+		if click = matchShortioClick(clicks, meta.Path, meta.UserAgent, time.Now().UTC()); click != nil {
+			break
+		}
+	}
+	if click == nil {
+		log.Printf("event=shortio_enrich_no_match domain=%q path=%q", domain, meta.Path)
+		return payload
+	}
+
+	if ip := strings.TrimPrefix(strings.TrimSpace(click.IP), "::ffff:"); meta.IP == "" && ip != "" {
+		decoded["ip"] = ip
+	}
+	if meta.Referrer == "" && click.Ref != "" {
+		decoded["referrer"] = click.Ref
+	}
+	// Stored for dashboard visibility; Umami derives location from the IP.
+	if click.Country != "" {
+		decoded["country"] = click.Country
+	}
+	if click.City != "" {
+		decoded["city"] = click.City
+	}
+	enriched, err := json.Marshal(decoded)
+	if err != nil {
+		return payload
+	}
+	log.Printf("event=shortio_enriched domain=%q path=%q ip_found=%t referrer_found=%t country=%q", domain, meta.Path, click.IP != "", click.Ref != "", click.Country)
+	return json.RawMessage(enriched)
 }
 
 func extractShortioMetadata(value any) shortioMetadata {
@@ -1581,6 +1881,11 @@ const dashboardTemplate = `<!doctype html>
               <label for="umami_website_id">Fallback site ID</label>
               <input id="umami_website_id" class="input" name="umami_website_id" value="{{.DefaultPropertyID}}" placeholder="site uuid">
               <span class="hint">Used when a domain isn't mapped.</span>
+            </div>
+            <div class="field">
+              <label for="shortio_api_key">Short.io API key</label>
+              <input id="shortio_api_key" class="input" name="shortio_api_key" value="{{.ShortioAPIKey}}" placeholder="sk_...">
+              <span class="hint">Enables click enrichment (visitor IP, referrer) from the Short.io statistics API.</span>
             </div>
             <div class="end" style="margin-top: 4px;">
               <button class="btn primary" type="submit">Save</button>
