@@ -22,11 +22,11 @@ func TestPersistEventAllowsEmptyDomainAndPropertyID(t *testing.T) {
 	defer db.Close()
 
 	receivedAt := time.Date(2026, 5, 13, 1, 2, 3, 0, time.UTC)
-	mock.ExpectExec("INSERT INTO event_history").
+	mock.ExpectQuery("INSERT INTO event_history").
 		WithArgs(receivedAt, "shortio", "", "", sqlmock.AnyArg(), false, "missing mapping").
-		WillReturnResult(sqlmock.NewResult(1, 1))
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(7))
 
-	err = persistEvent(context.Background(), db, Event{
+	id, err := persistEvent(context.Background(), db, Event{
 		ReceivedAt:   receivedAt,
 		Source:       "shortio",
 		Payload:      json.RawMessage(`{"event":"click"}`),
@@ -35,6 +35,32 @@ func TestPersistEventAllowsEmptyDomainAndPropertyID(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("persistEvent() error = %v", err)
+	}
+	if id != 7 {
+		t.Fatalf("persistEvent() id = %d, want 7", id)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+func TestUpdateEventMarksProcessingComplete(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New() error = %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectExec("UPDATE event_history").
+		WithArgs(int64(7), sqlmock.AnyArg(), true, "").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = updateEvent(context.Background(), db, 7, Event{
+		Payload:   json.RawMessage(`{"event":"click","ip":"203.0.113.7"}`),
+		Forwarded: true,
+	})
+	if err != nil {
+		t.Fatalf("updateEvent() error = %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
@@ -431,6 +457,18 @@ func TestEnrichShortioPayloadAddsIPAndReferrer(t *testing.T) {
 	statsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/domain/42/last_clicks" {
 			t.Fatalf("unexpected stats path %q", r.URL.Path)
+		}
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode last_clicks request: %v", err)
+		}
+		include, _ := request["include"].(map[string]any)
+		paths, _ := include["paths"].([]any)
+		if len(paths) != 1 || paths[0] != "/abc" {
+			t.Fatalf("last_clicks include.paths = %#v, want [/abc]", include)
+		}
+		if request["afterDate"] == nil {
+			t.Fatalf("last_clicks request missing afterDate: %#v", request)
 		}
 		dt := time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339)
 		_, _ = w.Write([]byte(`[{"dt":"` + dt + `","ip":"::ffff:203.0.113.7","path":"/abc","ua":"UA-1","ref":"https://example.com","country":"United States","city":"Santa Clara"}]`))
