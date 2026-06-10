@@ -400,8 +400,16 @@ func TestMatchShortioClick(t *testing.T) {
 	if got == nil || got.IP != "198.51.100.3" {
 		t.Fatalf("matchShortioClick = %#v, want newest matching click 198.51.100.3", got)
 	}
-	if got := matchShortioClick(clicks, "/abc", "UA-other", now); got != nil {
-		t.Fatalf("matchShortioClick with mismatched UA = %#v, want nil", got)
+	// Unknown UA falls back to the newest recent click on the path.
+	if got := matchShortioClick(clicks, "/abc", "UA-other", now); got == nil || got.IP != "198.51.100.3" {
+		t.Fatalf("matchShortioClick with mismatched UA = %#v, want path fallback 198.51.100.3", got)
+	}
+	// A UA match is preferred over a newer click with a different UA.
+	mixed := append([]shortioLastClick{
+		{DT: "2026-06-10T11:59:30.000Z", IP: "198.51.100.9", Path: "/abc", UA: "UA-2"},
+	}, clicks...)
+	if got := matchShortioClick(mixed, "/abc", "ua-1", now); got == nil || got.IP != "198.51.100.3" {
+		t.Fatalf("matchShortioClick UA preference = %#v, want 198.51.100.3", got)
 	}
 	if got := matchShortioClick(clicks, "/missing", "", now); got != nil {
 		t.Fatalf("matchShortioClick for unknown path = %#v, want nil", got)
