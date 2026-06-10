@@ -132,8 +132,74 @@ func TestForwardToUmamiBuildsTrackingPayload(t *testing.T) {
 	if payload["title"] != "Spring Offer" {
 		t.Fatalf("title = %#v, want Spring Offer", payload["title"])
 	}
-	if payload["name"] != "shortio-click" {
-		t.Fatalf("name = %#v, want shortio-click", payload["name"])
+	if name, exists := payload["name"]; exists {
+		t.Fatalf("name = %#v, want omitted so Umami records a pageview", name)
+	}
+}
+
+func TestForwardToUmamiAppendsShortLinkQueryAndDropsNullParams(t *testing.T) {
+	var receivedPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedPayload); err != nil {
+			t.Fatalf("decode forwarded payload: %v", err)
+		}
+		w.WriteHeader(204)
+	}))
+	defer server.Close()
+
+	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
+	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{
+		"path":"/offer",
+		"shortLinkQuery":"fbclid=abc123&utm_source=null"
+	}`), "sho.rt", "website-123", "route", server.URL+"/api/send", "")
+	if !ok || forwardErr != "" {
+		t.Fatalf("forwardToUmami() = (%v, %q), want success", ok, forwardErr)
+	}
+
+	payload, ok := receivedPayload["payload"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload = %#v, want object", receivedPayload["payload"])
+	}
+	if payload["url"] != "/offer?fbclid=abc123" {
+		t.Fatalf("url = %#v, want /offer?fbclid=abc123", payload["url"])
+	}
+}
+
+func TestForwardToUmamiSurfacesBotDrop(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"beep":"boop"}`))
+	}))
+	defer server.Close()
+
+	req := httptest.NewRequest("POST", "/webhooks/shortio", nil)
+	ok, forwardErr := (&app{}).forwardToUmami(req, json.RawMessage(`{"path":"/x"}`), "sho.rt", "website-123", "route", server.URL+"/api/send", "")
+	if !ok {
+		t.Fatalf("forwardToUmami() ok = false, want true for 200 response")
+	}
+	if !strings.Contains(forwardErr, "bot user agent") {
+		t.Fatalf("forwardErr = %q, want bot user agent note", forwardErr)
+	}
+}
+
+func TestNormalizeShortioQuery(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty", raw: "", want: ""},
+		{name: "literal null", raw: "null", want: ""},
+		{name: "drops null params", raw: "utm_source=null&utm_medium=null&fbclid=abc", want: "fbclid=abc"},
+		{name: "keeps real params", raw: "utm_source=email&utm_medium=newsletter", want: "utm_medium=newsletter&utm_source=email"},
+		{name: "strips leading question mark", raw: "?a=1", want: "a=1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeShortioQuery(tt.raw); got != tt.want {
+				t.Fatalf("normalizeShortioQuery(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
 	}
 }
 
