@@ -78,6 +78,7 @@ func main() {
 	setupPersistentLogging()
 	cfg := mustNewApp()
 	go cfg.logShortioDiagnostics(cfg.settingsSnapshot().ShortioAPIKey)
+	go cfg.reprocessPendingEvents()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -515,7 +516,11 @@ func initEventHistory(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
-func persistEvent(ctx context.Context, db *sql.DB, event Event) error {
+// pendingForwardError marks events persisted before background processing
+// finishes; startup reprocessing picks these up if a deploy interrupts them.
+const pendingForwardError = "processing"
+
+func persistEvent(ctx context.Context, db *sql.DB, event Event) (int64, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	payload := []byte(event.Payload)
@@ -526,10 +531,27 @@ func persistEvent(ctx context.Context, db *sql.DB, event Event) error {
 			payload = []byte("\"\"")
 		}
 	}
-	_, err := db.ExecContext(queryCtx, `
+	var id int64
+	err := db.QueryRowContext(queryCtx, `
 		INSERT INTO event_history (received_at, source, domain, property_id, payload, forwarded, forward_error)
 		VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
-	`, event.ReceivedAt, event.Source, event.Domain, event.PropertyID, payload, event.Forwarded, event.ForwardError)
+		RETURNING id
+	`, event.ReceivedAt, event.Source, event.Domain, event.PropertyID, payload, event.Forwarded, event.ForwardError).Scan(&id)
+	return id, err
+}
+
+func updateEvent(ctx context.Context, db *sql.DB, id int64, event Event) error {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	payload := []byte(event.Payload)
+	if !json.Valid(payload) {
+		payload = []byte("\"\"")
+	}
+	_, err := db.ExecContext(queryCtx, `
+		UPDATE event_history
+		SET payload = $2::jsonb, forwarded = $3, forward_error = $4
+		WHERE id = $1
+	`, id, payload, event.Forwarded, event.ForwardError)
 	return err
 }
 
@@ -567,7 +589,7 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	if resolveErr != nil {
 		event.Forwarded = false
 		event.ForwardError = resolveErr.Error()
-		if err := persistEvent(r.Context(), a.db, event); err != nil {
+		if _, err := persistEvent(r.Context(), a.db, event); err != nil {
 			log.Printf("failed to persist event: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -575,10 +597,17 @@ func (a *app) shortioWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enrichment can wait on Short.io's statistics pipeline, so respond to the
-	// webhook immediately and finish forwarding in the background.
+	// Persist immediately so every webhook is visible on the dashboard and
+	// survives restarts, then respond and finish enrichment/forwarding in the
+	// background (enrichment can wait on Short.io's statistics pipeline).
+	event.ForwardError = pendingForwardError
+	eventID, err := persistEvent(r.Context(), a.db, event)
+	if err != nil {
+		log.Printf("failed to persist event: %v", err)
+		eventID = 0
+	}
 	rc := requestContext{Host: r.Host, UserAgent: r.UserAgent(), AcceptLanguage: strings.TrimSpace(r.Header.Get("Accept-Language"))}
-	go a.processShortioEvent(event, rc, resolvedFrom, settings)
+	go a.processShortioEvent(eventID, event, rc, resolvedFrom, settings)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "accepted": true, "domain": domainForEvent, "property_id": propertyID})
 }
@@ -591,11 +620,13 @@ type requestContext struct {
 	AcceptLanguage string
 }
 
-func (a *app) processShortioEvent(event Event, rc requestContext, resolvedFrom string, settings runtimeSettings) {
+func (a *app) processShortioEvent(eventID int64, event Event, rc requestContext, resolvedFrom string, settings runtimeSettings) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	if settings.ShortioAPIKey != "" {
+	// Enrichment matching only looks 15 minutes back, so skip it for events
+	// recovered long after the click (e.g. replayed after a restart).
+	if settings.ShortioAPIKey != "" && time.Since(event.ReceivedAt) < 15*time.Minute {
 		event.Payload = a.enrichShortioPayload(ctx, settings.ShortioAPIKey, event.Domain, event.Payload)
 	}
 
@@ -605,8 +636,57 @@ func (a *app) processShortioEvent(event Event, rc requestContext, resolvedFrom s
 	} else {
 		log.Printf("event=webhook_forward_failed source=shortio domain=%q property_id=%q resolved_from=%s error=%q", event.Domain, event.PropertyID, resolvedFrom, event.ForwardError)
 	}
-	if err := persistEvent(ctx, a.db, event); err != nil {
+	if eventID > 0 {
+		if err := updateEvent(ctx, a.db, eventID, event); err != nil {
+			log.Printf("failed to update event %d: %v", eventID, err)
+		}
+		return
+	}
+	if _, err := persistEvent(ctx, a.db, event); err != nil {
 		log.Printf("failed to persist event: %v", err)
+	}
+}
+
+// reprocessPendingEvents forwards events that were persisted but whose
+// background processing was interrupted (e.g. by a redeploy mid-enrichment).
+func (a *app) reprocessPendingEvents() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT id, received_at, source, domain, property_id, payload
+		FROM event_history
+		WHERE forwarded = false AND forward_error = $1 AND received_at > now() - interval '24 hours'
+		ORDER BY received_at ASC
+		LIMIT 100
+	`, pendingForwardError)
+	if err != nil {
+		cancel()
+		log.Printf("event=reprocess_query_failed error=%q", err)
+		return
+	}
+	type pendingEvent struct {
+		id    int64
+		event Event
+	}
+	var pending []pendingEvent
+	for rows.Next() {
+		var p pendingEvent
+		var payload []byte
+		if err := rows.Scan(&p.id, &p.event.ReceivedAt, &p.event.Source, &p.event.Domain, &p.event.PropertyID, &payload); err != nil {
+			log.Printf("event=reprocess_scan_failed error=%q", err)
+			break
+		}
+		p.event.Payload = json.RawMessage(payload)
+		pending = append(pending, p)
+	}
+	rows.Close()
+	cancel()
+	if len(pending) == 0 {
+		return
+	}
+	log.Printf("event=reprocess_pending count=%d", len(pending))
+	settings := a.settingsSnapshot()
+	for _, p := range pending {
+		a.processShortioEvent(p.id, p.event, requestContext{}, "recovered", settings)
 	}
 }
 func parseShortioWebhookPayload(body []byte, contentType string) (json.RawMessage, string, error) {
@@ -943,8 +1023,20 @@ func (a *app) shortioDomainInfoFor(ctx context.Context, apiKey, domain string) (
 	return nil, fmt.Errorf("domain %q not found in Short.io account", domain)
 }
 
-func fetchShortioLastClicks(ctx context.Context, apiKey string, domainID int64) ([]shortioLastClick, error) {
-	body, err := json.Marshal(map[string]any{"limit": 25, "period": "today", "tz": "UTC"})
+func fetchShortioLastClicks(ctx context.Context, apiKey string, domainID int64, path string) ([]shortioLastClick, error) {
+	// Filter to the clicked path and the last 15 minutes: period=today can
+	// return the day's clicks oldest-first, so without the filter a morning
+	// bot burst fills the page and recent clicks never appear.
+	request := map[string]any{
+		"limit":     50,
+		"period":    "today",
+		"tz":        "UTC",
+		"afterDate": time.Now().UTC().Add(-15 * time.Minute).Format(time.RFC3339),
+	}
+	if path != "" {
+		request["include"] = map[string]any{"paths": []string{path}}
+	}
+	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
 	}
@@ -1076,6 +1168,14 @@ func (a *app) enrichShortioPayload(ctx context.Context, apiKey, domain string, p
 		return payload
 	}
 
+	path := meta.Path
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
 	var click *shortioLastClick
 	// Short.io's statistics pipeline can lag the webhook by a minute or more,
 	// so keep polling for up to ~2 minutes before giving up on enrichment.
@@ -1087,15 +1187,15 @@ func (a *app) enrichShortioPayload(ctx context.Context, apiKey, domain string, p
 			case <-time.After(10 * time.Second):
 			}
 		}
-		clicks, err := fetchShortioLastClicks(ctx, apiKey, info.ID)
+		clicks, err := fetchShortioLastClicks(ctx, apiKey, info.ID, path)
 		if err != nil {
 			log.Printf("event=shortio_last_clicks_failed domain=%q attempt=%d error=%q", domain, attempt+1, err)
 			continue
 		}
-		if click = matchShortioClick(clicks, meta.Path, meta.UserAgent, time.Now().UTC()); click != nil {
+		if click = matchShortioClick(clicks, path, meta.UserAgent, time.Now().UTC()); click != nil {
 			break
 		}
-		log.Printf("event=shortio_enrich_attempt domain=%q path=%q attempt=%d clicks=%d sample=%q", domain, meta.Path, attempt+1, len(clicks), shortioClickSample(clicks))
+		log.Printf("event=shortio_enrich_attempt domain=%q path=%q attempt=%d clicks=%d sample=%q", domain, path, attempt+1, len(clicks), shortioClickSample(clicks))
 	}
 	if click == nil {
 		log.Printf("event=shortio_enrich_no_match domain=%q path=%q", domain, meta.Path)
