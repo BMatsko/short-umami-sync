@@ -592,7 +592,7 @@ type requestContext struct {
 }
 
 func (a *app) processShortioEvent(event Event, rc requestContext, resolvedFrom string, settings runtimeSettings) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
 	if settings.ShortioAPIKey != "" {
@@ -995,9 +995,10 @@ func decodeShortioClicks(data []byte) ([]shortioLastClick, error) {
 	return nil, fmt.Errorf("unrecognized short.io last_clicks response shape: %s", truncateForLog(data, 256))
 }
 
-// matchShortioClick finds the newest click matching the webhook's path and
-// user agent, no older than 15 minutes, so concurrent clicks on other links
-// don't cross-contaminate.
+// matchShortioClick finds the newest click matching the webhook's path, no
+// older than 15 minutes. A click with the same user agent is preferred, but
+// when none matches (user agents can be reformatted between the webhook and
+// the statistics pipeline) the newest recent click on the path is used.
 func matchShortioClick(clicks []shortioLastClick, path, ua string, now time.Time) *shortioLastClick {
 	if path == "" {
 		path = "/"
@@ -1005,8 +1006,8 @@ func matchShortioClick(clicks []shortioLastClick, path, ua string, now time.Time
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	var best *shortioLastClick
-	var bestDT time.Time
+	var bestUA, bestPath *shortioLastClick
+	var bestUADT, bestPathDT time.Time
 	for i := range clicks {
 		click := &clicks[i]
 		clickPath := click.Path
@@ -1019,9 +1020,6 @@ func matchShortioClick(clicks []shortioLastClick, path, ua string, now time.Time
 		if clickPath != path {
 			continue
 		}
-		if ua != "" && click.UA != "" && click.UA != ua {
-			continue
-		}
 		dt, err := time.Parse(time.RFC3339, click.DT)
 		if err != nil {
 			continue
@@ -1029,12 +1027,34 @@ func matchShortioClick(clicks []shortioLastClick, path, ua string, now time.Time
 		if now.Sub(dt) > 15*time.Minute || dt.Sub(now) > 2*time.Minute {
 			continue
 		}
-		if best == nil || dt.After(bestDT) {
-			best = click
-			bestDT = dt
+		if bestPath == nil || dt.After(bestPathDT) {
+			bestPath = click
+			bestPathDT = dt
+		}
+		if ua != "" && strings.EqualFold(strings.TrimSpace(click.UA), strings.TrimSpace(ua)) {
+			if bestUA == nil || dt.After(bestUADT) {
+				bestUA = click
+				bestUADT = dt
+			}
 		}
 	}
-	return best
+	if bestUA != nil {
+		return bestUA
+	}
+	return bestPath
+}
+
+// shortioClickSample summarizes the first few clicks for diagnostics when
+// matching fails.
+func shortioClickSample(clicks []shortioLastClick) string {
+	var parts []string
+	for i, click := range clicks {
+		if i >= 3 {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("dt=%s path=%s ip_set=%t ua=%s", click.DT, click.Path, click.IP != "", truncateForLog([]byte(click.UA), 40)))
+	}
+	return strings.Join(parts, " | ")
 }
 
 // enrichShortioPayload fills in the visitor IP and referrer that Short.io's
@@ -1057,12 +1077,14 @@ func (a *app) enrichShortioPayload(ctx context.Context, apiKey, domain string, p
 	}
 
 	var click *shortioLastClick
-	for attempt := 0; attempt < 3; attempt++ {
+	// Short.io's statistics pipeline can lag the webhook by a minute or more,
+	// so keep polling for up to ~2 minutes before giving up on enrichment.
+	for attempt := 0; attempt < 13; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return payload
-			case <-time.After(3 * time.Second):
+			case <-time.After(10 * time.Second):
 			}
 		}
 		clicks, err := fetchShortioLastClicks(ctx, apiKey, info.ID)
@@ -1073,6 +1095,7 @@ func (a *app) enrichShortioPayload(ctx context.Context, apiKey, domain string, p
 		if click = matchShortioClick(clicks, meta.Path, meta.UserAgent, time.Now().UTC()); click != nil {
 			break
 		}
+		log.Printf("event=shortio_enrich_attempt domain=%q path=%q attempt=%d clicks=%d sample=%q", domain, meta.Path, attempt+1, len(clicks), shortioClickSample(clicks))
 	}
 	if click == nil {
 		log.Printf("event=shortio_enrich_no_match domain=%q path=%q", domain, meta.Path)
