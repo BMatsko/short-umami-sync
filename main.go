@@ -68,10 +68,12 @@ type app struct {
 	shortioMu        sync.Mutex
 	shortioDomains   map[string]shortioDomainInfo
 	shortioDomainsAt time.Time
-	mu               sync.Mutex
-	events           []Event
-	tmplLogin        *template.Template
-	tmplDash         *template.Template
+	// Set when Short.io rejects afterDate as a plan-gated filter.
+	shortioNoAfterDate bool
+	mu                 sync.Mutex
+	events             []Event
+	tmplLogin          *template.Template
+	tmplDash           *template.Template
 }
 
 func main() {
@@ -1023,18 +1025,36 @@ func (a *app) shortioDomainInfoFor(ctx context.Context, apiKey, domain string) (
 	return nil, fmt.Errorf("domain %q not found in Short.io account", domain)
 }
 
-func fetchShortioLastClicks(ctx context.Context, apiKey string, domainID int64, path string) ([]shortioLastClick, error) {
-	// Filter to the clicked path and the last 15 minutes: period=today can
-	// return the day's clicks oldest-first, so without the filter a morning
-	// bot burst fills the page and recent clicks never appear.
-	request := map[string]any{
-		"limit":     50,
-		"period":    "today",
-		"tz":        "UTC",
-		"afterDate": time.Now().UTC().Add(-15 * time.Minute).Format(time.RFC3339),
+// fetchShortioLastClicks pulls recent raw clicks. Matching happens
+// client-side: the include/exclude filters of the statistics API are gated to
+// Team/Enterprise plans, so they must not be sent. afterDate narrows results
+// to the match window; if Short.io rejects it too, the call is retried without
+// it (and that downgrade is remembered) with a larger page instead.
+func (a *app) fetchShortioLastClicks(ctx context.Context, apiKey string, domainID int64) ([]shortioLastClick, error) {
+	a.shortioMu.Lock()
+	skipAfterDate := a.shortioNoAfterDate
+	a.shortioMu.Unlock()
+
+	clicks, err := fetchShortioLastClicksRequest(ctx, apiKey, domainID, !skipAfterDate)
+	if err != nil && !skipAfterDate && strings.Contains(err.Error(), "plan") {
+		log.Printf("event=shortio_after_date_unsupported domain_id=%d error=%q", domainID, err)
+		a.shortioMu.Lock()
+		a.shortioNoAfterDate = true
+		a.shortioMu.Unlock()
+		return fetchShortioLastClicksRequest(ctx, apiKey, domainID, false)
 	}
-	if path != "" {
-		request["include"] = map[string]any{"paths": []string{path}}
+	return clicks, err
+}
+
+func fetchShortioLastClicksRequest(ctx context.Context, apiKey string, domainID int64, withAfterDate bool) ([]shortioLastClick, error) {
+	request := map[string]any{
+		"limit":  150,
+		"period": "today",
+		"tz":     "UTC",
+	}
+	if withAfterDate {
+		request["limit"] = 100
+		request["afterDate"] = time.Now().UTC().Add(-15 * time.Minute).Format(time.RFC3339)
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
@@ -1187,7 +1207,7 @@ func (a *app) enrichShortioPayload(ctx context.Context, apiKey, domain string, p
 			case <-time.After(10 * time.Second):
 			}
 		}
-		clicks, err := fetchShortioLastClicks(ctx, apiKey, info.ID, path)
+		clicks, err := a.fetchShortioLastClicks(ctx, apiKey, info.ID)
 		if err != nil {
 			log.Printf("event=shortio_last_clicks_failed domain=%q attempt=%d error=%q", domain, attempt+1, err)
 			continue

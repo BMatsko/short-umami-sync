@@ -462,10 +462,10 @@ func TestEnrichShortioPayloadAddsIPAndReferrer(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("decode last_clicks request: %v", err)
 		}
-		include, _ := request["include"].(map[string]any)
-		paths, _ := include["paths"].([]any)
-		if len(paths) != 1 || paths[0] != "/abc" {
-			t.Fatalf("last_clicks include.paths = %#v, want [/abc]", include)
+		// include/exclude filters are Team/Enterprise-only on Short.io and
+		// must never be sent.
+		if _, exists := request["include"]; exists {
+			t.Fatalf("last_clicks request must not use plan-gated include filter: %#v", request)
 		}
 		if request["afterDate"] == nil {
 			t.Fatalf("last_clicks request missing afterDate: %#v", request)
@@ -494,6 +494,46 @@ func TestEnrichShortioPayloadAddsIPAndReferrer(t *testing.T) {
 	}
 	if decoded["country"] != "United States" {
 		t.Fatalf("country = %#v, want United States", decoded["country"])
+	}
+}
+
+func TestFetchShortioLastClicksDropsAfterDateWhenPlanGated(t *testing.T) {
+	var requests int
+	statsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode last_clicks request: %v", err)
+		}
+		if request["afterDate"] != nil {
+			w.WriteHeader(500)
+			_, _ = w.Write([]byte(`{"error":"Upstream client error: Filters are only available for users with Team or Enterprise plan. Please upgrade your account"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`[{"dt":"2026-06-10T12:00:00.000Z","ip":"203.0.113.7","path":"/abc"}]`))
+	}))
+	defer statsServer.Close()
+
+	oldStats := shortioStatsBase
+	shortioStatsBase = statsServer.URL
+	defer func() { shortioStatsBase = oldStats }()
+
+	a := &app{}
+	clicks, err := a.fetchShortioLastClicks(context.Background(), "sk_test", 42)
+	if err != nil || len(clicks) != 1 {
+		t.Fatalf("fetchShortioLastClicks() = %#v, %v, want one click via fallback", clicks, err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2 (afterDate attempt then fallback)", requests)
+	}
+
+	// The downgrade is remembered: the next call goes straight to the
+	// fallback shape.
+	if _, err := a.fetchShortioLastClicks(context.Background(), "sk_test", 42); err != nil {
+		t.Fatalf("second fetchShortioLastClicks() error = %v", err)
+	}
+	if requests != 3 {
+		t.Fatalf("requests = %d, want 3 (no afterDate retry once downgraded)", requests)
 	}
 }
 
